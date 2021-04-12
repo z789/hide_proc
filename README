@@ -1,0 +1,26 @@
+使用热补丁技术（livepatch)实现进程的隐藏。 测试环境是ubuntu 20.04 kernel v5.4
+
+
+隐藏的内容：
+  进程的隐藏：
+   1. /proc 目录下不显示该进程pid目录及子目录 （已实现）
+   2. 进程的fork/execv等信息不通过 cn_proc 发送 （已实现）
+   3. 进程的fork/execv等信息不通过 audit 发送 （未实现）
+   4. 不能使用trace相关工具查看到该进程的相关信息（未实现）
+    
+  内核模块的隐藏：
+   1. /proc/module 文件中不显示内核模块 （已实现）
+   2. /proc/kallsyms 中不显示内核模块中的符号 （已实现）
+   3. /sys/module 目录下不显示该内核模块  （已实现）
+   4. /sys/kernel/livepatch/ 目录下不显示该内核模块 （已实现）
+   5. 不能通过 /sys/kernel/tracing/enabled_functions 查看到相关信息 （未实现）
+   6. /proc/sys/kernel/tainted 文件不能显示加载的内核模块信息 （未实现）
+   7. 内核的日志信息中 不能显示加载的内核模块信息 （未实现）
+   
+   
+对抗使用内核模块检测该 模块：
+   hook住 init_module系统调用（未实现）
+   
+   
+ TODO:
+   
