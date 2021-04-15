@@ -25,6 +25,8 @@
 对抗使用内核模块检测该 模块：
    可设置modules_disabled为1， 通过参数force_modules_disabled=1设置 
 
+TODO:
+
 使用示例：
 sudo insmod  ./hidden_proc.ko hidden_base_exe=0 hidden_proc_name="hidden_comm","hidden_comm1"
    
