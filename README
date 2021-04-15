@@ -15,7 +15,7 @@
    4. /sys/kernel/livepatch/ 目录下不显示该内核模块 （已实现）
    5. 不能通过 /sys/kernel/tracing/enabled_functions 查看到相关信息 （已实现）
    6. /proc/sys/kernel/tainted 文件不能显示加载的内核模块相关信息 （已实现）
-   7. 内核的日志信息中 不能显示加载的内核模块信息 （未实现）
+   7. 内核的日志信息中 不能显示加载的内核模块信息 （已实现）
    
    
 对抗使用内核模块检测该 模块：
