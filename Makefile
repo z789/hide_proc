@@ -1,5 +1,6 @@
 ifneq ($(KERNELRELEASE),)
 	obj-m := hidden_proc.o
+	hidden_proc-y := hidden_proc_main.o ftrace_hook.o
 #	CFLAGS_sm3.o+=-DSM3_MACRO -Wno-shift-count-overflow
 else
 	KERNELDIR ?= /lib/modules/`uname  -r`/build
