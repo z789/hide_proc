@@ -13,6 +13,7 @@
    3. 进程的fork/execv等信息不通过 audit 发送 （已实现）
    4. 不能使用trace相关工具查看到该进程的相关信息（未实现）
    5. kernel 版本大于5.0.1, 不能使用fanotify查看到相关信息
+   6. Check syscalls about other proccess.
     
   内核模块的隐藏：
    1. /proc/module 文件中不显示该内核模块 （已实现）
