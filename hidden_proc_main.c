@@ -140,6 +140,9 @@ static int (*p_ddebug_remove_module)(const char *mod_name) = NULL;
 static const struct kernel_symbol *p__start___ksymtab = NULL;
 static const struct kernel_symbol *p__stop___ksymtab = NULL;
 
+//user tainted mask 
+static unsigned long usr_tainted_mask = 0;
+module_param(usr_tainted_mask, ulong, 0644);
 static unsigned long *p_tainted_mask = NULL;
 
 //static struct ftrace_ops __rcu **p_ftrace_ops_list = NULL;
@@ -642,7 +645,10 @@ end:
 
 static void clear_livepatch_tainted_mask(void)
 {
-	clear_bit(TAINT_LIVEPATCH, p_tainted_mask);
+	if (usr_tainted_mask != 0)
+		*p_tainted_mask = usr_tainted_mask;
+	else
+		clear_bit(TAINT_LIVEPATCH, p_tainted_mask);
 }
 
 #if 0
