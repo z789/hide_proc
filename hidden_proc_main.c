@@ -140,8 +140,6 @@ static int (*p_ddebug_remove_module)(const char *mod_name) = NULL;
 static const struct kernel_symbol *p__start___ksymtab = NULL;
 static const struct kernel_symbol *p__stop___ksymtab = NULL;
 
-
-static unsigned long old_tainted_mask = 0;
 static unsigned long *p_tainted_mask = NULL;
 
 //static struct ftrace_ops __rcu **p_ftrace_ops_list = NULL;
@@ -642,15 +640,9 @@ end:
 	return;
 }
 
-static void save_tainted_mask(void)
+static void clear_livepatch_tainted_mask(void)
 {
-	old_tainted_mask = *p_tainted_mask;
-}
-
-static void restore_tainted_mask(void)
-{
-	*p_tainted_mask = old_tainted_mask; 
-	old_tainted_mask = 0;
+	clear_bit(TAINT_LIVEPATCH, p_tainted_mask);
 }
 
 #if 0
@@ -2010,7 +2002,6 @@ static int livepatch_init(void)
 	fh_install_hooks(hooks, ARRAY_SIZE(hooks));
 	hidden_from_enabled_functions_ftrace_hooks(hooks, ARRAY_SIZE(hooks));
 
-	save_tainted_mask();
 	ret = klp_enable_patch(&patch);
 	if (ret == 0) { 
 		hidden_module(this_module);
@@ -2021,7 +2012,7 @@ static int livepatch_init(void)
 	register_kretprobes(rps, 2);
 	hidden_from_enabled_functions_kprobe(rps, 2);
 
-	restore_tainted_mask();
+	clear_livepatch_tainted_mask();
 
 	*p_modules_disabled = force_modules_disabled;
 	//clear_klog();
