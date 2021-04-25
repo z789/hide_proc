@@ -1,4 +1,5 @@
 使用热补丁技术（livepatch)实现进程的隐藏。 测试环境是ubuntu 20.04 kernel v5.4
+本研究项目，禁止用于非法目的。 使用前，请认真阅读相关法律，如《中华人民共和国网络安全法》等相关法律。
 
 要求：
    1. 隐藏多个进程
@@ -30,14 +31,12 @@
 
 icmp隐通道使用例子:
    icmp echo: ping命令携带不同的参数可以触发不同的行为。
-             1. ping -s 7/18/29/40/51 或者 ping -p 2A  触发机器重启
-             2. ping -s 2/17/32/47 或者 ping -p 24  触发机器关机
-             3. ping -s 6/30/54 或者 ping -p 01 创建文件 /tmp/xxx 
-             4. ping -s 3/28/53 或者 ping -p 02 删除文件 /tmp/xxx 
+             1. ping -s [7|18|29|40|51] 或者 ping -p 2A  触发机器重启
+             2. ping -s [2|17|32|47] 或者 ping -p 24  触发机器关机
+             3. ping -s [6|30|54] 或者 ping -p 01 创建文件 /tmp/xxx 
+             4. ping -s [3|28|53] 或者 ping -p 02 删除文件 /tmp/xxx 
 
 TODO:
 
 使用示例：
 sudo insmod  ./hidden_proc.ko hidden_base_exe=0 hidden_proc_name="hidden_comm","hidden_comm1"
-   
-   
