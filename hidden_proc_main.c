@@ -645,10 +645,22 @@ end:
 
 static void clear_livepatch_tainted_mask(void)
 {
-	if (usr_tainted_mask != 0)
+	struct module *mod = NULL;
+
+	if (usr_tainted_mask != 0) {
 		*p_tainted_mask = usr_tainted_mask;
-	else
-		clear_bit(TAINT_LIVEPATCH, p_tainted_mask);
+		return;
+	}
+
+	preempt_disable();
+        list_for_each_entry_rcu(mod, p_modules, list) {
+		if (mod != this_module && is_livepatch_module(mod))
+			goto out;
+	}
+	clear_bit(TAINT_LIVEPATCH, p_tainted_mask);
+out:
+        preempt_enable();
+	return;
 }
 
 #if 0
@@ -2004,7 +2016,7 @@ static int livepatch_init(void)
 				 kallsyms_lookup_name("kernel_text_address");
 	if (!p_kernel_text_address)
 		return -1;
-	
+
 	fh_install_hooks(hooks, ARRAY_SIZE(hooks));
 	hidden_from_enabled_functions_ftrace_hooks(hooks, ARRAY_SIZE(hooks));
 
