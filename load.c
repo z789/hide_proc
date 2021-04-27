@@ -36,37 +36,19 @@ end:
 	return ret;
 }
 
-#if 0
-static int clear_file(char *fname, int len)
+static void clear_file(char *fname, int len)
 {
 	int ret = -1;
-	int fd = -1;
 	int i = 0;
-	int count = 0;
-	char zero_buf[4096] = {0};
-
-	fd = open(fname, O_WRONLY);
-	if (fd < 0)
-		goto end;
+	char *srm_path[] = {"/usr/bin/srm", "/bin/srm", "/usr/local/bin/srm",
+                              "/usr/sbin/srm", "/sbin/srm", "/usr/local/sbin/srm", NULL};
+	while (srm_path[i]) {
+		if (access(srm_path[i], X_OK) == 0)
+			execl(srm_path[i], "srm", fname, NULL);
+	}
 
 	unlink(fname);
-	
-	count = len/sizeof(zero_buf);
-	for (i=0; i<count; i++)
-		ret = write(fd, zero_buf, sizeof(zero_buf));
-
-	count = len - count*sizeof(zero_buf);
-	for (i=0; i<count; i++)
-		ret = write(fd, zero_buf, 1);
-
-	ret = 0;
-
-end:
-	if (fd >= 0)
-		close(fd);
-	return ret;
 }
-#endif
 
 static int anti_parse(void)
 {
@@ -133,8 +115,8 @@ end:
 		free(buf);
 	}
 	
-	unlink(argv[0]);
-	//clear_file(argv[0], st.st_size);
+	//unlink(argv[0]);
+	clear_file(argv[0], st.st_size);
 
 	return ret;	
 }
