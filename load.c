@@ -39,7 +39,7 @@ int main(int argc, char **argv)
 	char *buf = NULL;
 
 	char *module_image = NULL;
-	int m_size = 49736;
+	int m_size = 0;
 	char *m_params = "";
 
 	if (argc < 1 || argc > 2) {
