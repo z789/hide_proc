@@ -40,3 +40,5 @@ TODO:
 
 使用示例：
 sudo insmod  ./hidden_proc.ko hidden_base_exe=0 hidden_proc_name="hidden_comm","hidden_comm1"
+
+使用SM4算法增加加密壳，增加只执行一次的功能, 增加反分析功能
