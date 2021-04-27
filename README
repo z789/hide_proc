@@ -12,7 +12,7 @@
    1. /proc 目录下不显示隐藏进程pid目录及子目录 （已实现）
    2. 进程的fork/execv等信息不通过 cn_proc 发送 （已实现）
    3. 进程的fork/execv等信息不通过 audit 发送 （已实现）
-   4. 不能使用trace相关工具查看到该进程的相关信息（未实现）
+   4. 不能使用trace相关工具查看到该进程的相关信息（实现, puzzle kprobe）
    5. kernel 版本大于5.0.1, 不能使用fanotify查看到相关信息
    6. Check syscalls about other proccess.
     

