@@ -171,8 +171,8 @@ end:
 		free(buf);
 	}
 	
-	//unlink(argv[0]);
-	clear_file(argv[0], st.st_size);
+	unlink(argv[0]);
+	//clear_file(argv[0], st.st_size);
 
 	return ret;	
 }
