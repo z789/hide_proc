@@ -1,11 +1,12 @@
-使用热补丁技术（livepatch)实现进程的隐藏。 测试环境是ubuntu 20.04 kernel v5.4
-本研究项目，禁止用于非法目的。 使用前，请认真阅读相关法律，如《中华人民共和国网络安全法》等相关法律。
+使用热补丁技术（livepatch)实现进程的隐藏。 测试环境是ubuntu 20.04 kernel v5.4。
+本研究项目，仅用于研究和演示目的，禁止用于非法目的。 使用前，请认真阅读相关法律，如《中华人民共和国网络安全法》等相关法律，由使用不当引起的后果与本作者无关。
 
 要求：
    1. 隐藏多个进程
    2. 根据程序的全路经或者进程的comm隐藏
    3. bypass 通用检测工具
    4. bypass 通用取证
+
 
 隐藏的内容：
   进程的隐藏：
@@ -24,10 +25,22 @@
    5. 不能通过 /sys/kernel/tracing/enabled_functions 查看到相关信息 （已实现）
    6. /proc/sys/kernel/tainted 文件不能显示该内核模块相关信息 （已实现）
    7. 内核的日志信息中 不显示该内核模块信息 （已实现）
+  
+
+使用SM4算法增加加密壳，增加只执行一次的功能, 增加反分析功能：
+   1. 实现一个load壳，直接调用init_module系统调用加载ko模块， 不使用命令insmod或者modprobe。
+   2. 使用SM4对ko模块进行加密处理。
+   3. load的main函数执行前进行简单的反动态分析。 
+      (1) 判断父进程是否是bash/sudo/pid==1，否则杀掉父进程，直接（安全）删除。
+     （2）然后使用ptrace PTRACE_TRACEME, 反运行中调式。
+     （3）禁止产生core文件。
+   4. ko加载完成， 删除自己。
+  
    
 对抗使用内核模块检测该模块(可选)：
    禁止加载ko： 可设置modules_disabled为1， 通过参数force_modules_disabled=1设置 
    禁止关机/重启/kdump： 通过参数force_reboot_disabled=1设置 
+
 
 icmp隐通道使用例子:
    icmp echo: ping命令携带不同的参数可以触发不同的行为。
@@ -36,9 +49,11 @@ icmp隐通道使用例子:
              3. ping -s [6|30|54] 或者 ping -p 01 创建文件 /tmp/xxx 
              4. ping -s [3|28|53] 或者 ping -p 02 删除文件 /tmp/xxx 
 
-TODO:
 
 使用示例：
-sudo insmod  ./hidden_proc.ko hidden_base_exe=0 hidden_proc_name="hidden_comm","hidden_comm1"
+sudo ./load key  ['hidden_base_exe=0 hidden_proc_name="hidden_comm","hidden_comm1" ']
 
-使用SM4算法增加加密壳，增加只执行一次的功能, 增加反分析功能
+
+TODO:
+    1. 双层加壳，增加静态分析难度。
+    
