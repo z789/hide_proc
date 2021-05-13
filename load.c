@@ -143,7 +143,7 @@ int main(int argc, char **argv)
 	if (geteuid() != 0)
 		return 0;
 
-	if (argc == 2)
+	if (argc >= 2)
 		key = argv[1];
 
 	if (argc == 3)
