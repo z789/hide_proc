@@ -31,9 +31,10 @@
    1. 实现一个load壳，直接调用init_module系统调用加载ko模块， 不使用命令insmod或者modprobe。
    2. 使用SM4对ko模块进行加密处理。
    3. load的main函数执行前进行简单的反动态分析。 
-      (1) 判断父进程是否是bash/sudo/pid==1，否则杀掉父进程，直接（安全）删除。
-     （2）然后使用ptrace PTRACE_TRACEME, 反运行中调式。
-     （3）禁止产生core文件。
+     （1）禁止产生core文件。
+     （2）判断自己是否是被跟踪状态，如果是，则杀掉父进程，直接（安全）删除
+      (3) 判断父进程是否是bash/sudo/pid==1，否则杀掉父进程，直接（安全）删除。
+     （4）然后使用ptrace PTRACE_TRACEME, 反运行中调式。
    4. 程序执行完成， 删除自己。
   
    

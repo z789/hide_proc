@@ -80,24 +80,69 @@ end:
 	return ret;
 }
 
+static inline int is_ptraced_stat(pid_t pid)
+{
+	char path[PATH_MAX] = {0};
+	char buf [512] = {0};
+	int fd = -1;
+	int len = 0;
+	char *ptr = NULL;
+	int ret = 0;
+	
+	snprintf(path, sizeof(path), "/proc/%d/status", pid);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		goto end;
+	len = read(fd, buf, sizeof(buf));
+	close(fd);
+	if (len < 0)
+		goto end;
+	
+	ptr = strstr(buf, "\nState:\t");
+	if (!ptr)
+		goto end;
+	if (*(ptr+strlen("\nState:\t")) != 't')
+		goto end;
+
+	ptr = strstr(ptr, "\nTracerPid:\t");
+	if (!ptr)
+		goto end;
+
+	if (*(ptr+strlen("\nTracerPid:\t")) != '0')
+		goto end;
+	ret = 1;
+	
+end:
+	return ret;
+}
+
 /*
   Parent must is 'shell' or init/systemd 
 */
-static inline int check_parent(pid_t ppid)
+static inline int is_deny_parent(pid_t ppid)
 {
 	char comm[16] = {0};
-	char exe[PATH_MAX] = {0};
 
 	read_comm(comm, sizeof(comm), ppid);
 	if (strncmp(comm, "bash", 4) != 0 && strncmp(comm, "sh", 2) != 0
 		 && strncmp(comm, "dash", 4) != 0 && strncmp(comm, "sudo", 4) != 0 
 		 && ppid != 1) {
-		read_exe(exe, sizeof(exe), getpid());
-		unlink(exe);
-		kill(ppid, SIGKILL);
-		exit(0);
+		return 1;
 	}
 
+	return 0;
+} 
+
+static inline int check_debug(void)
+{
+	char exe[PATH_MAX] = {0};
+
+	if (is_ptraced_stat(getpid()) || is_deny_parent(getppid())) { 
+		read_exe(exe, sizeof(exe), getpid());
+		unlink(exe);
+		kill(getppid(), SIGKILL);
+		exit(0);
+	}
 	return 0;
 } 
 
@@ -112,7 +157,7 @@ __attribute__((constructor)) void anti_parse(void)
 	if (ret < 0)
 		goto clear;
 	
-	check_parent(getppid());
+	check_debug();
 	//forbid ptrace
 	if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) != 0)
 		goto clear;
