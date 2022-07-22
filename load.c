@@ -117,7 +117,7 @@ end:
 }
 
 /*
-  Parent must is 'shell' or init/systemd 
+  Parent must is 'shell' or 'sudo' or init/systemd 
 */
 static inline int is_deny_parent(pid_t ppid)
 {
@@ -176,7 +176,7 @@ int main(int argc, char **argv)
 	char *buf = NULL;
 
 	char *module_image = NULL;
-	int m_size = 51080;
+	int m_size = 58576;
 	char *m_params = "";
 	char *key = NULL;
 
@@ -208,6 +208,7 @@ int main(int argc, char **argv)
 	sm4_decrypt_ctr(module_image, m_size, key); 
 	memset(key, 0, strlen(key));
 
+	fprintf(stdout, "module params:%s\n", m_params);
 	ret = init_module(module_image, m_size, m_params);
 	
 end:

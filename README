@@ -1,4 +1,4 @@
-使用热补丁技术（livepatch)实现进程的隐藏。 测试环境是ubuntu 20.04 kernel v5.4。
+使用hook技术（kprobe、ftrace、 livepatch)实现进程、内核模块的隐藏。 测试环境是ubuntu 20.04 kernel v5.4。
 本研究项目，仅用于研究和演示目的，禁止用于非法目的。 使用前，请认真阅读相关法律，如《中华人民共和国网络安全法》等相关法律，由使用不当引起的后果与本作者无关。
 
 要求：
@@ -13,7 +13,7 @@
    1. /proc 目录下不显示隐藏进程pid目录及子目录 （已实现）
    2. 进程的fork/execv等信息不通过 cn_proc 发送 （已实现）
    3. 进程的fork/execv等信息不通过 audit 发送 （已实现）
-   4. 不能使用trace相关工具查看到该进程的相关信息（实现, puzzle kprobe）
+   4. 不能使用trace相关工具查看到该进程的相关信息（实现, puzzle kprobe, disable (e)bpf for detect rootkit）
    5. kernel 版本大于5.0.1, 不能使用fanotify查看到相关信息
    6. Check syscalls about other proccess.
     
@@ -52,7 +52,7 @@ icmp隐通道使用例子:
 
 
 使用示例：
-sudo ./load key  ['hidden_base_exe=0 hidden_proc_name="hidden_comm","hidden_comm1" ']
+sudo ./load key  ['hidden_base_exe=0 hidden_proc_name="hidden_comm,hidden_comm1"']
 
 
 TODO:
