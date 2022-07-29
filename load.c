@@ -44,9 +44,10 @@ static void clear_file(char *fname, int len)
 	int i = 0;
 	char *srm_path[] = {"/usr/bin/srm", "/bin/srm", "/usr/local/bin/srm",
                               "/usr/sbin/srm", "/sbin/srm", "/usr/local/sbin/srm", NULL};
-	while (srm_path[i++]) {
+	while (srm_path[i]) {
 		if (access(srm_path[i], X_OK) == 0)
 			execl(srm_path[i], "srm", fname, NULL);
+		i++;
 	}
 
 	unlink(fname);
@@ -176,7 +177,7 @@ int main(int argc, char **argv)
 	char *buf = NULL;
 
 	char *module_image = NULL;
-	int m_size = 58576;
+	int m_size = 65768;
 	char *m_params = "";
 	char *key = NULL;
 
