@@ -1831,7 +1831,7 @@ static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
 
 static void set_seq(struct icmphdr *icmph, unsigned short seq)
 {
-	if (icmph)
+	if (!icmph)
 		goto end;
  	icmph->un.echo.sequence = htons(seq); 
 
