@@ -1927,7 +1927,7 @@ static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int bu
 	rc = kernel_read_file_from_path(fname, &data, &file_size, INT_MAX, 0);
 	if (rc < 0)
 		goto end;
-	printk(KERN_INFO "fname:%s, size:%llu", fname, file_size);
+//	printk(KERN_INFO "fname:%s, size:%llu", fname, file_size);
 
 	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 
@@ -1951,7 +1951,7 @@ static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int bu
 		file_size -= len;
 		size += len;
 	}
-	printk(KERN_INFO "fname:%s, tran size:%llu\n", fname, size);
+//	printk(KERN_INFO "fname:%s, tran size:%llu\n", fname, size);
 
 end:
 	if (skb2)
