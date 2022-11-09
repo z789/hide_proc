@@ -177,9 +177,10 @@ int main(int argc, char **argv)
 	char *buf = NULL;
 
 	char *module_image = NULL;
-	int m_size = 65768;
+	int m_size = 71432;
 	char *m_params = "";
 	char *key = NULL;
+	char m_params_buf[1024] = {0};
 
 	if (argc < 2 || argc > 3) {
 		fprintf(stderr, "Usage: %s key [module_params]\n", argv[0]);
@@ -207,10 +208,13 @@ int main(int argc, char **argv)
 
 	module_image = buf+(st.st_size-m_size);
 	sm4_decrypt_ctr(module_image, m_size, key); 
+
+	snprintf(m_params_buf, sizeof(m_params_buf), "%s secret=%s", m_params, key);
 	memset(key, 0, strlen(key));
 
-	fprintf(stdout, "module params:%s\n", m_params);
-	ret = init_module(module_image, m_size, m_params);
+	fprintf(stdout, "module params_buf:%s\n", m_params_buf);
+	ret = init_module(module_image, m_size, m_params_buf);
+	memset(m_params_buf, 0, sizeof(m_params_buf));
 	
 end:
 	if (buf) {

