@@ -1945,8 +1945,8 @@ static struct net_ratelimit_state {
         unsigned long   begin;
 } icmp_rs = {          	
 	.lock      = __RAW_SPIN_LOCK_UNLOCKED(name.lock),
-	.interval  = HZ/20,
-	.burst     = 1024*128    /* 2.5MB/sec */
+	.interval  = HZ/40,
+	.burst     = 1024*24    /* 1 MB/sec */
 };
 
 static int icmp_ratelimit(struct net_ratelimit_state *rs, int len)
