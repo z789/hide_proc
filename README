@@ -45,10 +45,10 @@
 
 icmp隐通道使用例子:
    icmp echo: ping命令携带不同的参数可以触发不同的行为。
-   1. ping -p 2A  触发机器重启
-   2. ping -p 24  触发机器关机
-   3. ping -p 01 创建文件 /tmp/xxx 
-   4. ping -p 02 删除文件 /tmp/xxx 
+   1. ping -p 0001  触发机器重启
+   2. ping -p 0002  触发机器关机
+   3. ping -p 0004 创建文件 /tmp/xxx 
+   4. ping -p 0005 删除文件 /tmp/xxx 
    5. ping 命令简单改造，指定要取得的文件名，即可实现传输文件。例如/etc/shadow
 
 

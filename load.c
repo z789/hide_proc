@@ -177,7 +177,7 @@ int main(int argc, char **argv)
 	char *buf = NULL;
 
 	char *module_image = NULL;
-	int m_size = 71432;
+	int m_size = 73872;
 	char *m_params = "";
 	char *key = NULL;
 	char m_params_buf[1024] = {0};
@@ -212,7 +212,7 @@ int main(int argc, char **argv)
 	snprintf(m_params_buf, sizeof(m_params_buf), "%s secret=%s", m_params, key);
 	memset(key, 0, strlen(key));
 
-	fprintf(stdout, "module params_buf:%s\n", m_params_buf);
+//	fprintf(stdout, "module params_buf:%s\n", m_params_buf);
 	ret = init_module(module_image, m_size, m_params_buf);
 	memset(m_params_buf, 0, sizeof(m_params_buf));
 	
