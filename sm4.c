@@ -15,7 +15,7 @@ static rfc3686_blk ctr = {
 	{0x00, 0x00, 0x00, 0x01}  /* counter */
 };
 
-static const char SBOX[256] = {
+static const unsigned char SBOX[256] = {
 	0xd6, 0x90, 0xe9, 0xfe, 0xcc, 0xe1, 0x3d, 0xb7,
 	0x16, 0xb6, 0x14, 0xc2, 0x28, 0xfb, 0x2c, 0x05,
 	0x2b, 0x67, 0x9a, 0x76, 0x2a, 0xbe, 0x04, 0xc3,
@@ -159,7 +159,7 @@ static const unsigned int CK[32] = {
 		MODE(x1, x2, x3, x4, x0, 31);   \
 	} while (0)
 
-static void sm4_encrypt_init(struct sm4_ctx *ctx, const char *in_key, rfc3686_blk *blk)
+static void sm4_encrypt_init(struct sm4_ctx *ctx, const unsigned char *in_key, rfc3686_blk *blk)
 {
 	unsigned int *rk = ctx->key.rk;
 	unsigned int x0, x1, x2, x3, x4;
@@ -174,7 +174,7 @@ static void sm4_encrypt_init(struct sm4_ctx *ctx, const char *in_key, rfc3686_bl
 	memcpy(&ctx->blk, blk, sizeof(*blk));
 }
 
-static void sm4_process(const struct sm4_ctx *ctx, char *out, const char *in)
+static void sm4_process(const struct sm4_ctx *ctx, unsigned char *out, const unsigned char *in)
 {
 	const unsigned int *rk = ctx->key.rk;
 	unsigned int x0, x1, x2, x3, x4;
