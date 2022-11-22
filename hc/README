@@ -1,0 +1,49 @@
+
+管理端的命令行 hc
+
+1. 通信数据格式
+
+   管理端发送的数据格式:
+                                 net byteorder
+   | imcmpdhr | + | timestamp | + | cmd code | + | content |
+     8 bytes        16 bytes         2 bytes    optional content
+
+                                  |<------- crypted ------>| 
+
+   管理端接收的数据格式:
+                                 net byteorder
+   | imcmpdhr | + | timestamp | + | cmd code | + | content |
+     8 bytes        16 bytes         2 bytes    optional content
+
+                                  |<------- crypted ------>| 
+
+2. 支持的命令：
+   restart | shutdown | secret | create | delete | write | getfilesize | getfile 
+
+   restart | shutdown: 不返回数据
+   secret  | getfilesize | getfile： 返回数据。
+   create |delete： 不返回数据， 仅仅在对端建立或删除文件。
+   write: 未实现。
+
+3. secret  | getfilesize | getfile
+
+   secret: 密钥协商，返回新的密钥。 返回的内容格式：
+ 
+   | secret_len | + | secret |
+     4 bytes         
+   net byteorder
+
+   getfilesize: 取得文件的长度。 返回的内容格式：
+
+   | filename | + '\0' + | filesize_len | + | file size |
+                            4 bytes             8 bytes 
+                           net byteorder
+
+   getsize: 取得文件。 返回的内容格式：
+
+   | filename | + '\0' + | data_len | + | file content |
+                            4 bytes          
+                          net byteorder
+    一个文件可能会返回多个数据包，直到接收到期望的长度或者超时。
+
+   

