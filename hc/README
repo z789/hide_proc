@@ -1,21 +1,14 @@
 
 管理端的命令行 hc
 
-1. 通信数据格式
+1. 通信数据格式:
 
-   管理端发送的数据格式:
                                  net byteorder
-   | imcmpdhr | + | timestamp | + | cmd code | + | content |
+   | icmphdr | + | timestamp | + | cmd code | + | content |
      8 bytes        16 bytes         2 bytes    optional content
 
                                   |<------- crypted ------>| 
 
-   管理端接收的数据格式:
-                                 net byteorder
-   | imcmpdhr | + | timestamp | + | cmd code | + | content |
-     8 bytes        16 bytes         2 bytes    optional content
-
-                                  |<------- crypted ------>| 
 
 2. 支持的命令：
    restart | shutdown | secret | create | delete | write | getfilesize | getfile 
@@ -46,4 +39,3 @@
                           net byteorder
     一个文件可能会返回多个数据包，直到接收到期望的长度或者超时。
 
-   
