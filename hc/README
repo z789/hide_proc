@@ -32,7 +32,7 @@
                             4 bytes             8 bytes 
                            net byteorder
 
-   getsize: 取得文件。 返回的内容格式：
+   getfilee: 取得文件。 返回的内容格式：
 
    | filename | + '\0' + | data_len | + | file content |
                             4 bytes          
